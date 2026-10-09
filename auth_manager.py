@@ -10,6 +10,7 @@ auth_manager.py — 多账号凭据管理
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -571,7 +572,9 @@ def _safe_resource_item(item: dict, now_ts: int) -> dict:
     expire_ts = expired_ts or deduction_end_ts or cycle_end_ts
     days_to_expire = None
     if expire_ts:
-        days_to_expire = int((expire_ts - now_ts) / 86400)
+        # 向上取整：保证「显示 N 天」与下方 30 天/7 天窗口判断（<= N 天）口径一致。
+        # 若用 int() 截断，30.9 天会显示「30 天」却不进 30 天提醒列表。
+        days_to_expire = math.ceil((expire_ts - now_ts) / 86400)
 
     package_name = str(item.get("PackageName") or item.get("DealName") or item.get("ProductName") or "额度包")
     product_name = str(item.get("ProductName") or item.get("SubProductName") or "")
