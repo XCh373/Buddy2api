@@ -20,6 +20,8 @@ pip-wheel-metadata/
 .env
 .env.*
 !.env.example
+.admin_token
+.client_key
 *.info
 *.pem
 *.key

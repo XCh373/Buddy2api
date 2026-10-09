@@ -22,6 +22,12 @@ import httpx
 
 import database as db
 
+# WorkBuddy 5.6+ 登录态 $wbEncrypted 信封解密（移植自 ShouZhuo0413/codebuddy2api）
+try:
+    import wb_atrest
+except ImportError:  # 模块缺失时退回"仅明文快照"行为
+    wb_atrest = None
+
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 USER_AGENT = "codebuddy-gateway/1.0"
@@ -227,22 +233,38 @@ def parse_auth_file(path: Path) -> Optional[dict]:
 
     account = data.get("account", {})
     auth = data.get("auth", {})
-    if not auth.get("accessToken"):
+
+    # WorkBuddy 5.6+ 将敏感字段（token/昵称/手机号）本地加密为
+    # {"$wbEncrypted":1,"envelope":...}；用本机 Electron 原生绑定派生保护钥解密。
+    def _field(v):
+        """明文字符串原样返回；$wbEncrypted 信封解密；其他类型返回空串。"""
+        if isinstance(v, str):
+            return v
+        if wb_atrest is not None and wb_atrest.is_encrypted_field(v):
+            try:
+                return wb_atrest.decrypt_auth_field(v)
+            except Exception:
+                return ""
+        return ""
+
+    token = _field(auth.get("accessToken"))
+    if not token:
+        # 加密但解密失败（如 WorkBuddy 未安装/密钥换代）→ 跳过该快照
         return None
 
     return {
-        "name": account.get("nickname", "") or path.stem,
-        "uid": account.get("uid", ""),
-        "nickname": account.get("nickname", ""),
-        "phone": account.get("phoneNumber", ""),
-        "account_type": account.get("type", "personal"),
-        "access_token": auth.get("accessToken", ""),
-        "refresh_token": auth.get("refreshToken", ""),
-        "expires_at": auth.get("expiresAt", 0),
-        "refresh_expires_at": auth.get("refreshExpiresAt", 0),
-        "domain": auth.get("domain", DEFAULT_DOMAIN),
-        "enterprise_id": account.get("enterpriseId", ""),
-        "session_state": auth.get("sessionState", ""),
+        "name": _field(account.get("nickname")) or path.stem,
+        "uid": _field(account.get("uid")) or "",
+        "nickname": _field(account.get("nickname")),
+        "phone": _field(account.get("phoneNumber")),
+        "account_type": account.get("type", "personal") if isinstance(account.get("type"), str) else "personal",
+        "access_token": token,
+        "refresh_token": _field(auth.get("refreshToken")),
+        "expires_at": auth.get("expiresAt", 0) if isinstance(auth.get("expiresAt"), (int, float)) else 0,
+        "refresh_expires_at": auth.get("refreshExpiresAt", 0) if isinstance(auth.get("refreshExpiresAt"), (int, float)) else 0,
+        "domain": _field(auth.get("domain")) or DEFAULT_DOMAIN,
+        "enterprise_id": _field(account.get("enterpriseId")),
+        "session_state": _field(auth.get("sessionState")),
     }
 
 
