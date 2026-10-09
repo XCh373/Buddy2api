@@ -52,7 +52,12 @@ _CURRENT_REQUEST: contextvars.ContextVar[Request | None] = contextvars.ContextVa
 async def _request_context(request: Request, call_next):
     token = _CURRENT_REQUEST.set(request)
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        # 管理接口返回的都是实时状态（账号/额度/日志），禁用浏览器缓存，
+        # 否则切回标签页时可能读到旧 JSON（历史上导致"新账号没显示"的误判）。
+        if request.url.path.startswith("/admin/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
     finally:
         _CURRENT_REQUEST.reset(token)
 
