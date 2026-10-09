@@ -291,28 +291,18 @@ async def admin_add_account(
     authorization: str | None = Header(default=None),
 ):
     _check_admin(authorization)
-    data = await request.json()
-    # 直接粘贴 auth JSON
-    auth_data = data.get("auth", {})
-    account_data = data.get("account", {})
-    parsed = {
-        "name": account_data.get("nickname", data.get("name", "")),
-        "uid": account_data.get("uid", ""),
-        "nickname": account_data.get("nickname", ""),
-        "phone": account_data.get("phoneNumber", ""),
-        "account_type": account_data.get("type", "personal"),
-        "access_token": auth_data.get("accessToken", ""),
-        "refresh_token": auth_data.get("refreshToken", ""),
-        "expires_at": auth_data.get("expiresAt", 0),
-        "refresh_expires_at": auth_data.get("refreshExpiresAt", 0),
-        "domain": auth_data.get("domain", "www.codebuddy.cn"),
-        "enterprise_id": account_data.get("enterpriseId", ""),
-        "session_state": auth_data.get("sessionState", ""),
-    }
-    if not parsed["access_token"]:
-        raise HTTPException(status_code=400, detail="No accessToken found in auth data")
-    aid = db.add_account(parsed)
-    return {"id": aid, "status": "ok"}
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体不是合法的 JSON")
+    # 直接粘贴 auth JSON；WorkBuddy 5.6+ 的加密字段由 auth_manager 统一解密
+    name = data.get("name", "") if isinstance(data, dict) else ""
+    parsed = auth_manager.parse_account_payload(data, name if isinstance(name, str) else "")
+    if not parsed:
+        raise HTTPException(status_code=400, detail="未找到可用的 accessToken（可能解密失败）")
+    # 与「一键导入」一致：uid 已存在则更新，避免插入重复账号
+    aid, action = auth_manager.upsert_account(parsed)
+    return {"id": aid, "status": "ok", "action": action}
 
 
 @app.put("/admin/accounts/{aid}")

@@ -28,6 +28,25 @@ try:
 except ImportError:  # 模块缺失时退回"仅明文快照"行为
     wb_atrest = None
 
+
+def _decrypt_field(value):
+    """WorkBuddy 5.6+ 将敏感字段本地加密为 {"$wbEncrypted":1,"envelope":...}。
+
+    明文字符串原样返回；加密信封尽力解密后返回明文字符串；
+    其他类型或解密失败返回空串。解析失败（如 WorkBuddy 未安装 / 密钥换代）
+    也返回空串，让调用方按"无有效字段"处理，而不会把明文信封对象（`[object Object]`）
+    暴露给前端。
+    """
+    if isinstance(value, str):
+        return value
+    if wb_atrest is not None and wb_atrest.is_encrypted_field(value):
+        try:
+            return wb_atrest.decrypt_auth_field(value)
+        except Exception:
+            return ""
+    return ""
+
+
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 USER_AGENT = "codebuddy-gateway/1.0"
@@ -165,18 +184,20 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
 
     account = data.get("account", {}) if isinstance(data, dict) else {}
     auth = data.get("auth", {}) if isinstance(data, dict) else {}
-    if not auth.get("accessToken"):
-        meta["reason"] = "未发现 accessToken"
+    token = _decrypt_field(auth.get("accessToken"))
+    if not token:
+        meta["reason"] = "未发现 accessToken 或解密失败"
         return meta
 
-    uid = account.get("uid", "")
+    uid = _decrypt_field(account.get("uid"))
+    nickname = _decrypt_field(account.get("nickname"))
     meta.update({
         "valid": True,
         "reason": "ok",
-        "account_name": account.get("nickname", "") or path.stem,
+        "account_name": nickname or path.stem,
         "uid_masked": _mask_value(uid),
-        "domain": auth.get("domain", DEFAULT_DOMAIN),
-        "expires_at": auth.get("expiresAt", 0),
+        "domain": _decrypt_field(auth.get("domain")) or DEFAULT_DOMAIN,
+        "expires_at": auth.get("expiresAt", 0) if isinstance(auth.get("expiresAt"), (int, float)) else 0,
         "already_imported": bool(uid and uid in existing_uids),
     })
     return meta
@@ -234,38 +255,97 @@ def parse_auth_file(path: Path) -> Optional[dict]:
     account = data.get("account", {})
     auth = data.get("auth", {})
 
-    # WorkBuddy 5.6+ 将敏感字段（token/昵称/手机号）本地加密为
-    # {"$wbEncrypted":1,"envelope":...}；用本机 Electron 原生绑定派生保护钥解密。
-    def _field(v):
-        """明文字符串原样返回；$wbEncrypted 信封解密；其他类型返回空串。"""
-        if isinstance(v, str):
-            return v
-        if wb_atrest is not None and wb_atrest.is_encrypted_field(v):
-            try:
-                return wb_atrest.decrypt_auth_field(v)
-            except Exception:
-                return ""
-        return ""
-
-    token = _field(auth.get("accessToken"))
+    token = _decrypt_field(auth.get("accessToken"))
     if not token:
         # 加密但解密失败（如 WorkBuddy 未安装/密钥换代）→ 跳过该快照
         return None
 
     return {
-        "name": _field(account.get("nickname")) or path.stem,
-        "uid": _field(account.get("uid")) or "",
-        "nickname": _field(account.get("nickname")),
-        "phone": _field(account.get("phoneNumber")),
+        "name": _decrypt_field(account.get("nickname")) or path.stem,
+        "uid": _decrypt_field(account.get("uid")) or "",
+        "nickname": _decrypt_field(account.get("nickname")),
+        "phone": _decrypt_field(account.get("phoneNumber")),
         "account_type": account.get("type", "personal") if isinstance(account.get("type"), str) else "personal",
         "access_token": token,
-        "refresh_token": _field(auth.get("refreshToken")),
+        "refresh_token": _decrypt_field(auth.get("refreshToken")),
         "expires_at": auth.get("expiresAt", 0) if isinstance(auth.get("expiresAt"), (int, float)) else 0,
         "refresh_expires_at": auth.get("refreshExpiresAt", 0) if isinstance(auth.get("refreshExpiresAt"), (int, float)) else 0,
-        "domain": _field(auth.get("domain")) or DEFAULT_DOMAIN,
-        "enterprise_id": _field(account.get("enterpriseId")),
-        "session_state": _field(auth.get("sessionState")),
+        "domain": _decrypt_field(auth.get("domain")) or DEFAULT_DOMAIN,
+        "enterprise_id": _decrypt_field(account.get("enterpriseId")),
+        "session_state": _decrypt_field(auth.get("sessionState")),
     }
+
+
+def parse_account_payload(data: dict, name: str = "") -> Optional[dict]:
+    """解析前端「高级手动添加」提交的账号数据，返回入库字段。
+
+    兼容两种形态：
+      - 完整 .info 结构：{"account": {...}, "auth": {...}}
+      - 已拍平的字段：{"nickname": ..., "access_token": ...}
+    WorkBuddy 5.6+ 的敏感字段是 {"$wbEncrypted":1,...} 信封，这里统一走
+    _decrypt_field 解密；解密后仍拿不到 accessToken 时返回 None，由调用方报 400，
+    避免把信封对象（dict）直接写库导致 500。
+    """
+    if not isinstance(data, dict):
+        return None
+
+    auth_data = data.get("auth") if isinstance(data.get("auth"), dict) else {}
+    account_data = data.get("account") if isinstance(data.get("account"), dict) else {}
+
+    def pick(nested: dict, nested_key: str, flat_key: str) -> str:
+        """优先取已拍平的字段（前端会用 {...d, name} 覆写），否则取 .info 嵌套字段。"""
+        value = _decrypt_field(data.get(flat_key))
+        if value:
+            return value
+        return _decrypt_field(nested.get(nested_key))
+
+    def num(nested: dict, nested_key: str, flat_key: str) -> int | float:
+        for src, key in ((data, flat_key), (nested, nested_key)):
+            value = src.get(key)
+            if isinstance(value, (int, float)):
+                return value
+        return 0
+
+    token = pick(auth_data, "accessToken", "access_token")
+    if not token:
+        return None
+
+    account_type = ""
+    for src, key in ((account_data, "type"), (data, "account_type")):
+        if isinstance(src.get(key), str) and src.get(key):
+            account_type = src[key]
+            break
+
+    nickname = pick(account_data, "nickname", "nickname")
+    return {
+        "name": (name or "").strip() or nickname,
+        "uid": pick(account_data, "uid", "uid"),
+        "nickname": nickname,
+        "phone": pick(account_data, "phoneNumber", "phone"),
+        "account_type": account_type or "personal",
+        "access_token": token,
+        "refresh_token": pick(auth_data, "refreshToken", "refresh_token"),
+        "expires_at": num(auth_data, "expiresAt", "expires_at"),
+        "refresh_expires_at": num(auth_data, "refreshExpiresAt", "refresh_expires_at"),
+        "domain": pick(auth_data, "domain", "domain") or DEFAULT_DOMAIN,
+        "enterprise_id": pick(account_data, "enterpriseId", "enterprise_id"),
+        "session_state": pick(auth_data, "sessionState", "session_state"),
+    }
+
+
+def upsert_account(parsed: dict) -> tuple[int, str]:
+    """按 uid 合并写入账号：uid 已存在则更新，否则新增。
+
+    返回 (account_id, action)，action 为 "updated" 或 "imported"。
+    uid 为空的凭据无法判定是否同一账号，一律新增（不参与合并）。
+    """
+    uid = (parsed.get("uid") or "").strip()
+    if uid:
+        for acc in db.list_accounts():
+            if (acc.get("uid") or "").strip() == uid:
+                db.update_account(acc["id"], parsed)
+                return acc["id"], "updated"
+    return db.add_account(parsed), "imported"
 
 
 def import_auth_file(path: Path) -> Optional[int]:
@@ -274,14 +354,8 @@ def import_auth_file(path: Path) -> Optional[int]:
     if not parsed:
         return None
 
-    # 检查是否已存在（按 uid 去重）
-    existing = db.list_accounts()
-    for acc in existing:
-        if acc.get("uid") == parsed["uid"]:
-            db.update_account(acc["id"], parsed)
-            return acc["id"]
-
-    return db.add_account(parsed)
+    aid, _ = upsert_account(parsed)
+    return aid
 
 
 def auto_scan_and_import(auth_dir: Optional[str] = None) -> dict:
@@ -292,17 +366,8 @@ def auto_scan_and_import(auth_dir: Optional[str] = None) -> dict:
         if not parsed:
             result["skipped"] += 1
             continue
-        existing = db.list_accounts()
-        found = False
-        for acc in existing:
-            if acc.get("uid") == parsed["uid"]:
-                db.update_account(acc["id"], parsed)
-                result["updated"] += 1
-                found = True
-                break
-        if not found:
-            db.add_account(parsed)
-            result["imported"] += 1
+        _, action = upsert_account(parsed)
+        result[action] += 1
     return result
 
 
