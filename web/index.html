@@ -555,11 +555,35 @@ createApp({
   function expireText(x){if(x.expired)return '已过期';if(x.days_to_expire===null||x.days_to_expire===undefined)return x.expire_time||'长期';if(x.days_to_expire<0)return '已过期';if(x.days_to_expire<=7)return x.days_to_expire+' 天内';return shortTime(x.expire_time)}
   function pkgBadge(x){if(x.expired)return 'err';if(Number(x.days_to_expire)>=0&&Number(x.days_to_expire)<=7)return 'inactive';return 'ok'}
   function clearPath(){authPath.value='';discover('')}
+  // 本机登录检测：WorkBuddy 每次登录/续期都会写一个新的 .info 快照，同一账号会累积几十条。
+  // 这里仅做展示层归并——每个账号只显示最新一条，其余折叠可展开；不涉及任何文件操作。
+  const expandedGroups=ref({});
+  const discRows=computed(()=>{
+    const groups=new Map();
+    (disc.value?.files||[]).forEach(f=>{
+      const key=(f.valid&&f.uid_masked)?f.uid_masked:('file:'+f.path);
+      if(!groups.has(key))groups.set(key,[]);
+      groups.get(key).push(f);
+    });
+    // 组内按修改时间倒序（最新在前），组间按各自最新快照倒序（最近登录的账号排最上）
+    const arr=[...groups.entries()].map(([k,v])=>[k,[...v].sort((a,b)=>Number(b.mtime||0)-Number(a.mtime||0))]);
+    arr.sort((a,b)=>Number(b[1][0].mtime||0)-Number(a[1][0].mtime||0));
+    const rows=[];
+    arr.forEach(([key,list])=>{
+      const latest=list[0],rest=list.slice(1);
+      rows.push({type:'file',key,f:latest,total:list.length,old:false});
+      if(rest.length&&expandedGroups.value[key])rest.forEach(f=>rows.push({type:'file',key,f,old:true}));
+      if(rest.length)rows.push({type:'more',key,count:rest.length,expanded:!!expandedGroups.value[key]});
+    });
+    return rows;
+  });
+  const discGroupCount=computed(()=>discRows.value.filter(r=>r.type==='file'&&!r.old).length);
+  function toggleGroup(key){expandedGroups.value={...expandedGroups.value,[key]:!expandedGroups.value[key]}}
   const hasDirty=computed(()=>l.value.some(dirty));
   onMounted(()=>{load(true);discover()});
   // 有未保存改动时不自动刷新，避免覆盖用户正在编辑的权重/优先级/余额快照
   onFocusRefresh(()=>{load(false);discover(authPath.value)},{canRefresh:()=>!hasDirty.value});
-  return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,hasDirty,load,loadCheckins,discover,scan,scanCustom,add,ref2,saveMeta,toggle,testOne,claimOne,claimAll,refreshAllResources,openPackages,refreshPackages,del,fmt,size,credit,tok,creditPct,claimText,officialBalance,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,shortTime,expireText,pkgBadge,clearPath,I}
+  return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,hasDirty,discRows,discGroupCount,toggleGroup,load,loadCheckins,discover,scan,scanCustom,add,ref2,saveMeta,toggle,testOne,claimOne,claimAll,refreshAllResources,openPackages,refreshPackages,del,fmt,size,credit,tok,creditPct,claimText,officialBalance,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,shortTime,expireText,pkgBadge,clearPath,I}
 },template:`
 <div>
   <div class="phead"><h1>账号管理</h1><p>多账号轮询 · 最少使用优先</p></div>
@@ -568,7 +592,7 @@ createApp({
     <div class="card-p">
       <div class="detect-summary">
         <div>
-          <div class="detect-title" v-if="disc">检测到 {{disc.file_count}} 个 .info 文件，其中 {{disc.valid_count}} 个有效</div>
+          <div class="detect-title" v-if="disc">检测到 {{disc.file_count}} 个 .info 文件，其中 {{disc.valid_count}} 个有效 · 归并后 {{discGroupCount}} 个账号</div>
           <div class="detect-title" v-else>正在检测本机登录文件</div>
           <div class="hint">Work Buddy 已在本机登录时，通常直接点“一键导入”即可；路径不标准时再填下面的自定义路径。</div>
         </div>
@@ -603,8 +627,8 @@ createApp({
           </div>
         </div>
         <div class="detect-files">
-          <table class="mini-table" v-if="disc?.files?.length"><thead><tr><th>文件</th><th>状态</th><th>UID</th><th>域名</th><th>修改时间</th><th>大小</th><th>目录</th></tr></thead><tbody>
-            <tr v-for="f in disc.files" :key="f.path"><td><div style="font-weight:600">{{f.account_name||f.name}}</div><div class="mono" :title="f.path">{{f.name}}</div></td><td><span class="badge" :class="f.valid?(f.already_imported?'inactive':'ok'):'err'">{{f.valid?(f.already_imported?'已导入':'可导入'):'无效'}}</span></td><td class="mono">{{f.uid_masked||'-'}}</td><td>{{f.domain||'-'}}</td><td class="mono">{{fmt(f.mtime)}}</td><td>{{size(f.size)}}</td><td class="mono" :title="f.dir">{{f.dir}}</td></tr>
+          <table class="mini-table" v-if="discRows.length"><thead><tr><th>文件</th><th>状态</th><th>UID</th><th>域名</th><th>修改时间</th><th>大小</th><th>目录</th></tr></thead><tbody>
+            <tr v-for="r in discRows" :key="r.key+':'+(r.f?r.f.path:'more')" :style="r.old?'opacity:.62':''"><template v-if="r.type==='file'"><td><div style="font-weight:600">{{r.f.account_name||r.f.name}}<span class="tag" v-if="r.total>1" style="margin-left:6px">共 {{r.total}} 条</span></div><div class="mono" :title="r.f.path">{{r.f.name}}</div></td><td><span class="badge" :class="r.f.valid?(r.f.already_imported?'inactive':'ok'):'err'">{{r.f.valid?(r.f.already_imported?'已导入':'可导入'):'无效'}}</span></td><td class="mono">{{r.f.uid_masked||'-'}}</td><td>{{r.f.domain||'-'}}</td><td class="mono">{{fmt(r.f.mtime)}}</td><td>{{size(r.f.size)}}</td><td class="mono" :title="r.f.dir">{{r.f.dir}}</td></template><td v-else colspan="7" style="text-align:center"><button class="btn s" @click="toggleGroup(r.key)">{{r.expanded?'收起 '+r.count+' 条历史快照':'另有 '+r.count+' 条历史快照 · 展开'}}</button></td></tr>
           </tbody></table>
           <div class="empty" style="padding:18px" v-else>未检测到 .info 文件</div>
         </div>
