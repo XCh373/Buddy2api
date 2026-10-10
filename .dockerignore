@@ -1,4 +1,7 @@
 __pycache__/
+.pytest_cache/
+.pytest-tmp*/
+.pytest-temp*/
 *.pyc
 *.db
 *.db-wal
@@ -11,6 +14,7 @@ data/
 *.secret
 *.credential
 *.credentials
+*.credentials.key
 .venv/
 venv/
 .git/

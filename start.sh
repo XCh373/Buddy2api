@@ -1,11 +1,32 @@
 #!/bin/bash
-# Buddy2api 前台启动脚本（开发/调试用）
-# 说明：
-#   - 解释器优先取 BUDDY2API_PYTHON（与 start-launchd.sh、launchd plist 一致），默认 python3。
-#   - 只检查依赖，不擅自 pip install，避免污染系统 Python / 全局环境。
-#   - 若端口已被占用（例如 launchd 已在跑），直接报错退出，避免重复实例抢端口。
-#     常驻运行请用 launchd：launchctl kickstart -k gui/$(id -u)/com.buddy2api.gateway
+set -euo pipefail
+
 cd "$(dirname "$0")"
+
+PORT="${BUDDY2API_PORT:-8787}"
+if [ -z "${CB_GATEWAY_ADMIN_TOKEN:-}" ] && [ -f .admin_token ]; then
+    CB_GATEWAY_ADMIN_TOKEN="$(cat .admin_token)"
+    export CB_GATEWAY_ADMIN_TOKEN
+fi
+
+# Respect an explicitly selected interpreter (used by the local launchd setup).
+# This path checks dependencies but never installs into that environment.
+if [ -n "${BUDDY2API_PYTHON:-}" ]; then
+    PY="$BUDDY2API_PYTHON"
+    if ! command -v "$PY" >/dev/null 2>&1; then
+        echo "  [错误] 未找到 Python 解释器: $PY"
+        exit 1
+    fi
+    if ! "$PY" -c 'import fastapi, uvicorn, httpx, cryptography' >/dev/null 2>&1; then
+        echo "  [错误] $PY 缺少 Buddy2api 依赖；请先在该环境安装 requirements.txt"
+        exit 1
+    fi
+    if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "  [错误] 端口 $PORT 已被占用"
+        exit 1
+    fi
+    exec "$PY" server.py --host 127.0.0.1 --port "$PORT" "$@"
+fi
 
 echo ""
 echo "  ========================================"
@@ -13,44 +34,59 @@ echo "   Buddy 2 API"
 echo "  ========================================"
 echo ""
 
-PY="${BUDDY2API_PYTHON:-python3}"
-PORT="${BUDDY2API_PORT:-8787}"
-LABEL="com.buddy2api.gateway"
+# 优先使用固定名称的 Conda 环境；无需提前 conda activate
+conda_exe=""
+if command -v conda >/dev/null 2>&1; then
+    conda_exe="$(command -v conda)"
+else
+    for candidate in "$HOME/miniconda3/bin/conda" "$HOME/anaconda3/bin/conda" "/opt/conda/bin/conda"; do
+        if [ -x "$candidate" ]; then
+            conda_exe="$candidate"
+            break
+        fi
+    done
+fi
 
-# 检查解释器
-if ! command -v "$PY" &> /dev/null; then
-    echo "  [错误] 未找到 Python 解释器: $PY"
-    echo "         可用 BUDDY2API_PYTHON 指定，例如："
-    echo "         BUDDY2API_PYTHON=$HOME/Buddy2api/.venv/bin/python ./start.sh"
+if [ -n "$conda_exe" ]; then
+    echo "  [环境] Conda: buddy2api"
+    if ! "$conda_exe" run -n buddy2api python --version >/dev/null 2>&1; then
+        echo "  [安装] 创建 Conda 环境 buddy2api (Python 3.12)..."
+        "$conda_exe" create -n buddy2api python=3.12 -y
+    fi
+    if ! "$conda_exe" run -n buddy2api python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+        echo "  [更新] 将 buddy2api 环境升级到 Python 3.12..."
+        "$conda_exe" install -n buddy2api python=3.12 -y
+    fi
+    if ! "$conda_exe" run -n buddy2api python -c 'import fastapi, uvicorn, httpx, cryptography' >/dev/null 2>&1; then
+        echo "  [安装] 安装锁定依赖..."
+        "$conda_exe" run -n buddy2api python -m pip install -r requirements.txt
+    fi
+    echo "  [启动] http://127.0.0.1:8787"
+    echo "  [停止] Ctrl+C"
+    echo ""
+    exec "$conda_exe" run --no-capture-output -n buddy2api python server.py --port "$PORT" "$@"
+fi
+
+echo "  [环境] 未找到 Conda，使用项目 .venv"
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "  [错误] 未找到 Python 3.10+，请安装 Miniconda 或 Python"
+    exit 1
+fi
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    echo "  [错误] Python 版本过低，请安装 Python 3.10+"
     exit 1
 fi
 
-# 检查依赖（只检查，不安装）
-if ! "$PY" -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
-    echo "  [错误] $PY 缺少依赖 (fastapi / uvicorn / httpx)"
-    echo "         请先在该解释器内安装，例如："
-    echo "         \"$PY\" -m pip install fastapi 'uvicorn[standard]' httpx"
-    echo "         或直接用 launchd 常驻：launchctl kickstart -k gui/$(id -u)/$LABEL"
-    exit 1
+venv_dir=".venv"
+if [ ! -x "$venv_dir/bin/python" ]; then
+    echo "  [安装] 创建项目虚拟环境..."
+    python3 -m venv "$venv_dir"
 fi
-
-# 检查端口占用，避免与 launchd 实例争抢导致 Errno 48 崩溃循环
-if command -v lsof &> /dev/null && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN > /dev/null 2>&1; then
-    echo "  [错误] 端口 $PORT 已被占用（可能 launchd 或另一个实例正在运行）"
-    echo "         查看占用：lsof -nP -iTCP:$PORT -sTCP:LISTEN"
-    echo "         重启常驻服务：launchctl kickstart -k gui/$(id -u)/$LABEL"
-    exit 1
+if ! "$venv_dir/bin/python" -c 'import fastapi, uvicorn, httpx, cryptography' >/dev/null 2>&1; then
+    echo "  [安装] 安装锁定依赖..."
+    "$venv_dir/bin/python" -m pip install -r requirements.txt
 fi
-
-echo "  [解释器] $PY"
-echo "  [启动] http://127.0.0.1:$PORT"
+echo "  [启动] http://127.0.0.1:8787"
 echo "  [停止] Ctrl+C"
 echo ""
-
-# 管理 Token 与常驻实例保持一致（同目录受保护文件 .admin_token，同 start-launchd.sh）
-if [ -z "${CB_GATEWAY_ADMIN_TOKEN:-}" ] && [ -f .admin_token ]; then
-    CB_GATEWAY_ADMIN_TOKEN="$(cat .admin_token)"
-    export CB_GATEWAY_ADMIN_TOKEN
-fi
-
-exec "$PY" server.py --host 127.0.0.1 --port "$PORT" "$@"
+exec "$venv_dir/bin/python" server.py --port "$PORT" "$@"

@@ -80,3 +80,14 @@ _mimo-backup-*/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local runtime cache and artifacts
+.workbuddy/
+.debug/
+
+# Ant Code composer uploads
+ant-code-uploads/
+
+# Local launchd credentials
+/.admin_token
+/.client_key

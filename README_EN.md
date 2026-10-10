@@ -1,264 +1,128 @@
-# Buddy2api
+# Buddy2api 2.0
 
-[English](README_EN.md) | 中文
+[English](README_EN.md) | [中文](README.md)
 
-> Convert your local Tencent Work Buddy / CodeBuddy accounts into an OpenAI-compatible API for use in OpenCode, OpenClaw, Cherry Studio, NextChat, and other tools.
+> Local consumer AI clients → one OpenAI-compatible API for Codex, OpenCode, Cherry Studio, NextChat, and similar agents. Work Buddy / CodeBuddy, QClaw, QwenWork, and TraeWork are on by default; pick one in the UI dropdown. Each request stays on one channel.
+
+Release **2.1.17**. Local use only. Do not expose this on the public internet, and do not share credentials, API keys, or the database.
+
+Default loopback startup opens the management page without an Admin Token. Restarting does not invalidate local access. Repeated startup opens the existing instance; a database can only be used by one process. Use `--no-browser` for background services. Setting `--admin-token` or `CB_GATEWAY_ADMIN_TOKEN` enables explicit token authentication and is required for non-loopback listeners. Enter that token in the management settings. Client API keys and upstream account credentials are unchanged.
 
 ## What is this?
 
-Buddy2api is a local gateway. It scans the login credentials saved by the Work Buddy / CodeBuddy desktop app or extension on your machine, forwards requests to Tencent's model API, and exposes a standard OpenAI-compatible interface locally.
+Buddy2api listens on `http://127.0.0.1:8787/v1`. You stay signed into the official apps; this gateway imports those sessions and forwards chat. Typical clients use Chat Completions. Codex uses `/v1/responses`; create the key as type Codex in the UI to enable Codex prompt sanitization.
 
-In short: you're already logged into Work Buddy with available credits. This project exposes those credits through `http://127.0.0.1:8787/v1` so other OpenAI-compatible clients can use them.
-
-This project is mainly for personal use and testing. Do not deploy publicly, do not share with others, and do not send your login credentials, API keys, or database files to anyone.
-
-## Features
-
-- **OpenAI Compatible** - `/v1/chat/completions` and `/v1/models`
-- **Streaming Output** - SSE streaming and non-streaming aggregated responses
-- **Auto Import Accounts** - Scans Work Buddy / CodeBuddy auth files on startup
-- **Multi-Account Routing** - Priority, weight, and weighted-load routing with automatic failover
-- **Account Diagnostics** - Enable/disable accounts, set weight/priority, refresh tokens, and run single-account tests
-- **Official Balance** - Accounts page can read official Work Buddy resource balance, credits expiring within 30 days, and package details
-- **Balance Snapshots** - Use a local current-balance snapshot as fallback when the official balance API is unavailable
-- **Manual Daily Credit Claim** - Claim today's credits per account or for all enabled accounts from the Accounts page
-- **Token Auto-Refresh** - Automatically refreshes tokens before expiry
-- **API Key Management** - Create separate keys for OpenCode, Cherry Studio, etc.
-- **Secure Key Storage** - Only SHA-256 hashes stored; full key shown once at creation
-- **Model Permission Control** - Restrict keys to specific models
-- **Daily Request Limits** - Set per-key daily request caps
-- **Dashboard** - Health, official credit summary, expiry reminders, request trend, model ranking, account status, key usage, and recent logs
-- **Web Management UI** - Manage accounts, keys, models, logs, and settings in browser
-- **Request Logging** - Records model, tokens, credit, duration, status codes, errors, with filtering, search, pagination, and details
-- **Client Setup Wizard** - Settings page presets for OpenCode / OpenClaw, sub2api Docker, Cherry Studio, NextChat, and curl
-- **Function Calling Passthrough** - Native `tools` / `tool_calls` support
-- **Model Aliases** - Built-in common aliases with custom extension support
-
-## Prerequisites
-
-1. Work Buddy / CodeBuddy installed and logged in on this machine.
-2. Logged-in account has available model credits.
-3. Best to run this project and calling clients on the same machine.
-
-Default Windows scan path:
-
-```text
-%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth
-```
-
-Use `CB_AUTH_DIR` if your auth files are in a different directory.
-
-## Quick Start
-
-### Windows
-
-Double-click:
-
-```bat
-start.bat
-```
-
-Or manually:
+All four channels are on by default. A channel with no local login shows empty on Accounts; nothing is imported until you click Import.
 
 ```powershell
-pip install fastapi "uvicorn[standard]" httpx
 python server.py
 ```
 
-For local browser access, the Web UI uses a same-origin HttpOnly admin cookie automatically. You usually do not need to paste the Admin Token manually.
+| Channel | Default | Where logins live |
+|---|---|---|
+| WorkBuddy / CodeBuddy | on | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth` |
+| QClaw | on | `%APPDATA%\QClaw` |
+| QwenWork | on | `%APPDATA%\QwenWorkCN` |
+| TraeWork | on | `%APPDATA%\TRAE SOLO CN\User\globalStorage` |
 
-For remote access or cookie fallback cases, set a fixed admin token:
+Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
+
+## Before you start
+
+1. **An empty Accounts page after startup is expected.** 2.0 does not import on boot. Pick a channel → Detect → Import. All four channels are in the dropdown.
+2. **One API key is one channel.** Create the key with a channel selected. A WorkBuddy key uses `auto` / `glm-5.2`; a QwenWork key uses `auto` or `qwork-advanced`; a TraeWork key uses `auto` or `qwen-3.7-plus`. Mismatched model/key returns 400 or 403 — there is no cross-vendor failover.
+3. **HTTP 503 `channel_unavailable`** means that channel has no imported account.
+4. **Run QClaw / QwenWork with `python server.py` on Windows.** A Linux Docker container cannot decrypt those DPAPI files; the UI says so. WorkBuddy can stay on Docker.
+5. If the chat client is itself in Docker, Base URL is `http://host.docker.internal:8787/v1`.
+
+WorkBuddy 5.6+ encrypts sensitive fields in `.info` login snapshots. Detection and manual import try to decrypt them with the locally installed WorkBuddy app; a snapshot is marked invalid or skipped if the local key cannot be read. The detection list groups snapshots by channel and UID, showing the newest by default while keeping older snapshots expandable.
+
+## Install
+
+1. [Git](https://git-scm.com/downloads), [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/) (Python 3.12), and sign into Work Buddy / CodeBuddy at least once.
+2. Reopen the terminal, then:
 
 ```powershell
-$env:CB_GATEWAY_ADMIN_TOKEN="change-this-token"
+git --version
+conda --version
+git clone https://github.com/wicm84266964/Buddy2api.git
+cd Buddy2api
+conda create -n buddy2api python=3.12 -y
+conda activate buddy2api
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 python server.py
 ```
 
-### Linux / macOS
+3. Open http://127.0.0.1:8787 → Accounts → Detect → Import → Test → API Keys (select a channel; pick Codex if the client is Codex) → point your client at `http://127.0.0.1:8787/v1`.
 
-```bash
-chmod +x start.sh
-./start.sh
-```
+Windows script: `.\start.bat`. Docker helper: `.\start-docker-win.ps1` (WorkBuddy mount; use native Python for QClaw/QwenWork).
 
-### Docker
+Later starts: `conda activate buddy2api` then `python server.py` in the project directory.
 
-On Windows Docker Desktop, use the helper script. It automatically finds the current Windows user's Work Buddy auth directory and mounts it into the container as read-only `/auth`:
+## FAQ
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start-docker-win.ps1
-```
+- `conda` not found: use Miniconda Prompt, or `conda init powershell` and reopen the terminal.
+- `No module named ...`: activate `buddy2api`, then `python -m pip install -r requirements.txt`.
+- Port 8787 in use: stop the old process or `python server.py --port 8788`.
+- No accounts in the UI: import has not been run yet.
+- Key create fails: the channel dropdown is required.
+- 403 `key_channel_mismatch`: the model prefix does not match the key’s channel.
+- 400 `unknown_model`: that model does not belong to this key’s channel.
 
-If you control Docker from WSL:
+## Update
 
-```bash
-chmod +x start-docker-wsl.sh
-./start-docker-wsl.sh
-```
+The management page checks for a newer `main` in the background (jsDelivr first). A top-bar **Update to vx.y.z** button runs `git pull --ff-only`, reinstalls requirements, and restarts. A failed check stays silent. Docker images, zip copies, and non-`main` checkouts keep using a manual pull. To preview the button on an already-current install, start with `CB_GATEWAY_FAKE_LATEST=9.9.9`; the click does not pull or restart.
 
-Both scripts look for:
+## Upgrade from 1.4.x
 
-```text
-C:\Users\<your username>\AppData\Local\CodeBuddyExtension\Data\Public\auth
-```
+The database migrates on startup. Existing keys stay on `workbuddy`. Startup no longer auto-imports; empty channel is 503; new keys must pick a channel; the official-balance column shows credits only.
 
-Inside the container it appears as:
-
-```text
-/auth
-```
-
-So the Web UI "rescan / one-click import" flow can find accounts without manually pasting `.info` files.
-
-If you only want to start the service without mounting the Windows auth directory:
-
-```bash
-docker-compose up -d
-```
-
-Open browser at:
-
-```text
-http://127.0.0.1:8787
-```
-
-Note: Docker containers cannot magically scan the Windows C drive. The auth directory must be mounted as a volume. The scripts automate that read-only mount.
-
-## Usage Flow
-
-1. Open Work Buddy / CodeBuddy and confirm you're logged in.
-2. Start this project.
-3. Check the "Accounts" page in Web UI to confirm accounts are imported.
-4. Create a key in the "API Keys" page for your client.
-5. Enter the Base URL and API Key in OpenCode, OpenClaw, Cherry Studio, NextChat, etc.
-
-The Accounts page prefers the official Work Buddy resource balance. It shows the official remaining balance, credits expiring within 30 days, and each credit package's cycle, remaining amount, used amount, and expiry time. The daily claimed 150 credits appear as official resource packages; the actual expiry time follows the upstream response and is usually about one month.
-
-Dashboard aggregates official balances across enabled accounts, credits expiring within 30 days, low-balance reminders, and stale-cache status. Official credit data uses a short local cache, so opening pages repeatedly does not spam the upstream API; manual refresh and successful claims force an update.
-
-If the official balance API is temporarily unavailable, you can still enter the current remaining balance shown by Work Buddy as a local snapshot. This is only a fallback estimate: only new `usage.credit` after saving is deducted.
-
-The Accounts page also provides manual daily credit claim actions. You can claim for one account or all enabled accounts. It does not run on a timer; if the upstream API reports already claimed, inactive campaign, or invalid account credentials, the UI shows that result directly.
-
-## Client Setup
+## Client
 
 | Field | Value |
 |---|---|
 | Base URL | `http://127.0.0.1:8787/v1` |
-| API Key | Create in Web UI → API Keys |
-| Model | `auto` / `glm-5.2` / `glm-5.1` / `kimi-k2.7` / `deepseek-v4-pro` / `deepseek-v4-flash` |
-| Stream | Recommended |
+| API Key | Created in the UI, bound to one channel |
+| Model | WorkBuddy `auto`; QClaw `auto`; QwenWork `qwork-advanced` |
 
-Currently implemented OpenAI-compatible endpoints:
+Unprefixed `auto` follows the key’s channel. Use a separate key per channel. On the Models page, “一键读取供应模型” refreshes each channel’s supplier list separately; a TraeWork-only id such as Doubao is never merged into WorkBuddy.
 
-```text
-/v1/chat/completions
-/v1/models
-```
+### Model capacity discovery
 
-If your client lets you choose the API type, select **OpenAI Compatible / Chat Completions**. Clients that are hard-wired to `/v1/responses` are not supported yet.
+Refreshing supplier models now retains upstream input/output capacities. `/v1/models` exposes `context_window` and `max_output_tokens`; WorkBuddy's `maxInputTokens` and `maxOutputTokens` map to these fields, rather than treating its desktop `contextWindow.defaultLength` as the maximum. DSH custom providers can import these capacities through **Fetch available models**, then add and save the selected models. Existing configured models are not overwritten automatically.
 
-If the calling client runs inside Docker, `127.0.0.1` points to the container itself, not the Windows host. In that case the Base URL is usually:
+Missing fields independently fall back to 262,144 context tokens and 32,768 output tokens on every channel. The per-field `capacity_source` is `catalog` or `fallback`. Fallbacks are configuration defaults, not verified upstream limits. Explicit `max_tokens` and `max_completion_tokens` requests are clamped only when the catalog contains a known output limit; converted Responses `max_output_tokens` requests use the same path. Omitted budgets stay omitted, and unknown capacities do not impose a hard cap. Reaching a configured output budget can still produce `length`; discovery does not prevent all long-task truncation.
 
-```text
-http://host.docker.internal:8787/v1
-```
+### Reasoning effort
 
-You can also copy common client presets directly from the Web UI "Settings" page.
+WorkBuddy's collected responses, including the default tool-stall retry path, reject partial text without completion metadata instead of synthesizing a successful `stop`. An explicit `finish_reason` followed by EOF remains valid without `[DONE]`. A `[DONE]` event alone does not make text without a finish reason complete. This validation does not determine whether a model's explicit `stop` is premature or resolve every long-session stall.
 
-### OpenCode Example
+Agent clients can send top-level `reasoning_effort` to Chat Completions and the standard `reasoning: {"effort": "high"}` object to Responses. Compatibility forms used by OpenCode, DSH, Cherry, and Claude-style clients are also accepted: `reasoning.effort`, `reasoningEffort`, `thinking.type`, `thinking.effort`, `output_config.effort`, and `enable_thinking`. Accepted levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; `off` is an alias for `none`.
 
-Add an OpenAI-compatible provider in OpenCode:
+| Channel | Effective capability |
+|---|---|
+| WorkBuddy | DeepSeek V4 Pro/Flash supports `low` / `high` / `max`; standard levels are projected onto those tiers. The default is `high` and can be disabled with `CB_GATEWAY_DEFAULT_REASONING_EFFORT=off` |
+| QClaw | The control is normalized to `reasoning_effort` and forwarded. Whether a tier takes effect depends on the selected upstream model; no gateway default is injected |
+| QwenWork | The protocol exposes only an `is_reasoning` switch. `none` disables it and any other explicit tier enables it; distinct effort levels are unavailable |
+| TraeWork | The current session protocol has no verified reasoning control field, so effort selection is not supported |
 
-```json
-{
-  "provider": {
-    "buddy2api": {
-      "name": "buddy2api",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "http://127.0.0.1:8787/v1",
-        "apiKey": "sk-cb-xxxxx"
-      },
-      "models": {
-        "auto": {
-          "name": "Buddy2api Auto",
-          "limit": {
-            "context": 200000,
-            "output": 32000
-          }
-        },
-        "glm-5.2": {
-          "name": "GLM-5.2",
-          "limit": {
-            "context": 200000,
-            "output": 32000
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Usage:
-
-```powershell
-opencode run -m buddy2api/auto "hello"
-```
-
-### curl Example
+Chat streams preserve `reasoning_content`. Responses streams expose standard `response.reasoning_summary_*` events and accept valid reasoning-only completions.
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-cb-xxxxx" \
+  -H "Authorization: Bearer sk-cb-your-key" \
   -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-## Start Parameters
+## Environment
 
-| Parameter | Default | Description |
-|---|---|---|
-| `--host` | `127.0.0.1` | Listen address |
-| `--port` | `8787` | Listen port |
-| `--admin-token` | auto-generated | Admin API token; local Web UI usually uses Cookie auth automatically |
-| `--no-admin-auth` | `false` | Disable admin auth, for local testing only |
+`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
 
-## Environment Variables
+`CB_GATEWAY_DEFAULT_REASONING_EFFORT` controls the default reasoning effort for WorkBuddy DeepSeek V4 Pro/Flash. It accepts `low`, `high`, or `max`, defaults to `high`, and can be disabled with `off`. A Responses `reasoning.effort` or Chat Completions `reasoning_effort` value overrides the default.
 
-| Variable | Description |
-|---|---|
-| `CB_GATEWAY_ADMIN_TOKEN` | Fixed admin token |
-| `CB_GATEWAY_DB_PATH` | SQLite database path |
-| `CB_AUTH_DIR` | Work Buddy / CodeBuddy auth file directory |
-| `CB_HOST_AUTH_DIR` | Host auth directory used by Docker helper scripts |
-| `CB_CONTAINER_AUTH_DIR` | Auth mount directory inside Docker, default `/auth` |
-
-## Data and Security
-
-- `codebuddy_gateway.db` stores imported account credentials and request logs.
-- API keys are stored as hashes only; full key is never shown again after creation.
-- Do not share your database, auth files, `.lab-agent`, logs, or screenshots.
-- Do not expose the service to public network addresses.
-- Keep the default `127.0.0.1` for safest local-only usage.
-
-## File Structure
-
-```text
-buddy2api/
-├── server.py           # FastAPI main service
-├── proxy.py            # Request proxy
-├── auth_manager.py     # Work Buddy / CodeBuddy credential management
-├── database.py         # SQLite data layer
-├── web/index.html      # Vue 3 Web UI
-├── Dockerfile
-├── docker-compose.yml
-├── docker-compose.windows.yml
-├── start.bat / start.sh
-├── start-docker-win.ps1 / start-docker-wsl.sh
-└── README.md
-```
+Keep `--host 127.0.0.1`. Do not share the database, auth folders, or key screenshots.
 
 ## License
 
