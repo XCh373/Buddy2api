@@ -4,10 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PORT="${BUDDY2API_PORT:-8787}"
-if [ -z "${CB_GATEWAY_ADMIN_TOKEN:-}" ] && [ -f .admin_token ]; then
-    CB_GATEWAY_ADMIN_TOKEN="$(cat .admin_token)"
-    export CB_GATEWAY_ADMIN_TOKEN
-fi
+# Loopback startup defaults to local same-origin management. Set CB_GATEWAY_ADMIN_TOKEN explicitly for token mode.
 
 # Respect an explicitly selected interpreter (used by the local launchd setup).
 # This path checks dependencies but never installs into that environment.

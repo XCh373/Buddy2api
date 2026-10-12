@@ -6,7 +6,7 @@
 
 Release **2.1.17**. Local use only. Do not expose this on the public internet, and do not share credentials, API keys, or the database.
 
-Default loopback startup opens the management page without an Admin Token. Restarting does not invalidate local access. Repeated startup opens the existing instance; a database can only be used by one process. Use `--no-browser` for background services. Setting `--admin-token` or `CB_GATEWAY_ADMIN_TOKEN` enables explicit token authentication and is required for non-loopback listeners. Enter that token in the management settings. Client API keys and upstream account credentials are unchanged.
+Default loopback startup opens the management page without an Admin Token. Restarting does not invalidate local access. Repeated startup opens the existing instance; a database can only be used by one process. Use `--no-browser` for background services. `start.sh` and `start-launchd.sh` do not automatically read `.admin_token`; setting `--admin-token` or `CB_GATEWAY_ADMIN_TOKEN` explicitly enables token authentication and is required for non-loopback listeners. Enter that token in management settings when token mode is enabled. Client API keys and upstream account credentials are unchanged.
 
 ## What is this?
 

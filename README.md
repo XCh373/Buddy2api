@@ -6,7 +6,7 @@
 
 当前版本 **2.1.17**。这个项目只适合本机自用，不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
 
-默认本机启动会自动打开管理页，无需填写管理 Token，重启后已有页面仍可直接使用。重复启动会打开已运行的同一实例；同一数据库不能同时由多个实例使用。后台服务可加 `--no-browser`。显式设置 `--admin-token` 或 `CB_GATEWAY_ADMIN_TOKEN` 时启用凭证管理模式；非本机监听必须设置该凭证，并在管理页设置中填写。客户端 API Key 和上游账号授权不受影响。
+默认本机启动会自动打开管理页，无需填写管理 Token，重启后已有页面仍可直接使用。重复启动会打开已运行的同一实例；同一数据库不能同时由多个实例使用。后台服务可加 `--no-browser`。`start.sh` 和 `start-launchd.sh` 与直接运行 `python server.py` 一样，不会自动读取 `.admin_token` 文件；显式传入 `--admin-token` 或设置 `CB_GATEWAY_ADMIN_TOKEN` 才启用令牌鉴权，非本机监听必须配置。启用令牌模式后需在管理页设置中填写。客户端 API Key 和上游账号授权不受影响。
 
 ## 这是什么？
 
@@ -96,7 +96,7 @@ python server.py
 
 ### 其他启动方式
 
-- **脚本：** Windows 安装 Python 时勾选 Add Python to PATH，在项目目录执行 `.\start.bat`。Linux / macOS：`chmod +x start.sh && ./start.sh`。脚本优先用名为 `buddy2api` 的 Conda 环境，没有 Conda 才建 `.venv`。
+- **脚本：** Windows 安装 Python 时勾选 Add Python to PATH，在项目目录执行 `.\start.bat`。Linux / macOS：`chmod +x start.sh && ./start.sh`。脚本优先用名为 `buddy2api` 的 Conda 环境，没有 Conda 才建 `.venv`；本机默认管理方式与直接运行 `python server.py` 一致。
 - **Docker：** `powershell -ExecutionPolicy Bypass -File .\start-docker-win.ps1`。本机没有 WorkBuddy 登录目录时脚本仍会启动。容器下拉里仍有四个通道，但 QClaw / QwenWork 请用上面的 `python server.py`。TraeWork 登录文件不是 DPAPI，本机 `python server.py` 导入后 Docker 也能用库里的 token。
 
 ### 第一次打开网页之后
