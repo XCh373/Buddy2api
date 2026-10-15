@@ -1349,7 +1349,12 @@ createApp({
   <div class="card card-p empty" v-else><div class="em">📋</div><p>暂无记录</p></div>
 </div>`
 }).component('stgs',{props:['token','toast','saveToken','ver','updating','checkVer','applyUpdate'],setup(p){
-  const defaults={backend_url:'https://copilot.tencent.com',default_domain:'www.codebuddy.cn',timeout:300,base_url:'http://127.0.0.1:8787/v1',admin_auth:localMode?'本机自动授权':'Admin Token',data_file:'codebuddy_gateway.db'};
+  const routingDefaults={mode:'legacy',expiry_window_days:30,cache_max_age_seconds:300,refresh_interval_seconds:120};
+  const defaults={backend_url:'https://copilot.tencent.com',default_domain:'www.codebuddy.cn',timeout:300,base_url:'http://127.0.0.1:8787/v1',admin_auth:localMode?'本机自动授权':'Admin Token',data_file:'codebuddy_gateway.db',workbuddy_routing:{...routingDefaults}};
+  const routePreview=ref(null),routeBusy=ref(false);
+  const routeReasons={legacy:'现有策略',expiry_candidate:'可优先消耗',no_snapshot:'尚无额度缓存',legacy_snapshot:'等待新版本额度刷新',refresh_failed:'查询失败，取消优先',cache_expired:'缓存已超时',invalid_snapshot:'额度信息不可信',no_expiring_credit:'无临期可用额度',local_usage_exhausted:'本地消耗已抵扣余额',lower_manual_priority:'手动优先级较低',cooldown:'失败冷却中',inactive:'账号未启用'};
+  function routingTime(ts){return ts?new Date(ts*1000).toLocaleString():'—'}
+  async function previewRouting(){if(routeBusy.value)return;routeBusy.value=true;try{routePreview.value=await api.get('/admin/routing/preview',p.token)}catch(e){p.toast(apiErr(e,'路由预览失败'),'err')}finally{routeBusy.value=false}}
   const s=ref({...defaults}),stats=ref(null),ld=ref(true),saving=ref(false),copied=ref(''),setupTab=ref('codex'),adminToken=ref(p.token||'');
   const keysList=ref([]),codexKeyInput=ref(''),codexStatus=ref(null),codexBusy=ref(false),codexResult=ref(null);
   const presets={
@@ -1362,8 +1367,8 @@ createApp({
     curl:{name:'curl',base:'http://127.0.0.1:8787/v1',model:'auto',note:'用于快速验证服务、Key 和模型映射是否正常。'},
   };
   async function load(){ld.value=true;try{const cfg=await api.get('/admin/settings',p.token);s.value={...defaults,...cfg};stats.value=await api.get('/admin/stats',p.token);keysList.value=await api.get('/admin/api-keys',p.token);if(keysList.value.length&&!codexKeyInput.value)codexKeyInput.value=keysList.value.find(k=>k.key)?.key||'';try{codexStatus.value=await api.get('/admin/codex/status',p.token)}catch(e){}}catch(e){p.toast(apiErr(e,'加载失败'),'err')}ld.value=false}
-  async function save(){if(saving.value)return;saving.value=true;try{await api.put('/admin/settings',{backend_url:s.value.backend_url,default_domain:s.value.default_domain,timeout:Number(s.value.timeout)||300},p.token);p.toast('已保存')}catch(e){p.toast(apiErr(e,'保存失败'),'err')}saving.value=false}
-  function resetDefaults(){s.value={...s.value,backend_url:defaults.backend_url,default_domain:defaults.default_domain,timeout:defaults.timeout};p.toast('已恢复默认','info')}
+  async function save(){if(saving.value)return;saving.value=true;try{await api.put('/admin/settings',{backend_url:s.value.backend_url,default_domain:s.value.default_domain,timeout:Number(s.value.timeout)||300,workbuddy_routing:s.value.workbuddy_routing},p.token);routePreview.value=null;p.toast('已保存')}catch(e){p.toast(apiErr(e,'保存失败'),'err')}saving.value=false}
+  function resetDefaults(){s.value={...s.value,backend_url:defaults.backend_url,default_domain:defaults.default_domain,timeout:defaults.timeout,workbuddy_routing:{...routingDefaults}};p.toast('已恢复默认','info')}
   function saveAdminToken(){p.saveToken(adminToken.value)}
   function clearAdminToken(){adminToken.value='';p.saveToken('')}
   async function codexSetup(){
@@ -1393,7 +1398,7 @@ createApp({
     }
     const x=currentPreset.value;return `curl ${x.base}/chat/completions \\\n  -H "Authorization: Bearer YOUR_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${x.model}","messages":[{"role":"user","content":"hi"}]}'`
   }
-  onMounted(load);return{localMode,s,stats,ld,saving,copied,setupTab,adminToken,presets,currentPreset,envBlock,curlBlock,load,save,resetDefaults,saveAdminToken,clearAdminToken,copy,n,I,keysList,codexKeyInput,codexStatus,codexBusy,codexResult,codexSetup}
+  onMounted(load);return{localMode,s,stats,ld,saving,copied,setupTab,adminToken,presets,currentPreset,envBlock,curlBlock,load,save,resetDefaults,saveAdminToken,clearAdminToken,copy,n,I,keysList,codexKeyInput,codexStatus,codexBusy,codexResult,codexSetup,routePreview,routeBusy,routeReasons,routingTime,previewRouting}
 },template:`
 <div>
   <div class="phead"><h1>设置</h1><p>运行配置、接入信息和本机维护</p></div>
@@ -1421,6 +1426,25 @@ createApp({
           <div class="status-line" style="margin-top:12px"><span class="badge" :class="stats?.active_accounts?'ok':'err'">Accounts</span><span class="badge" :class="stats?.active_keys?'ok':'err'">Keys</span><span class="tag">Timeout {{s.timeout}}s</span><span class="tag">v{{ver?.current||'__APP_VERSION__'}}</span><span class="tag warn" v-if="ver?.update_available">新版本 {{ver.latest}}</span></div>
           <div class="status-line" style="margin-top:10px"><button class="btn s" @click="checkVer(true)" :disabled="updating">检查更新</button><button class="btn s pri" v-if="ver?.update_available" @click="applyUpdate" :disabled="updating">{{updating?'更新中':'一键更新到 v'+ver.latest}}</button></div>
         </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h">WorkBuddy 账号路由<span class="sub">保存后对后续请求生效</span></div>
+      <div class="card-p">
+        <div class="form-grid">
+          <div class="field"><label>路由策略</label><select class="selectctl" v-model="s.workbuddy_routing.mode"><option value="legacy">现有策略</option><option value="expiry_first">临期额度优先</option></select></div>
+          <div class="field"><label>临期窗口（天）</label><input v-model.number="s.workbuddy_routing.expiry_window_days" type="number" min="1" max="30"/></div>
+          <div class="field"><label>缓存最大年龄（秒）</label><input v-model.number="s.workbuddy_routing.cache_max_age_seconds" type="number" min="60" max="1800"/></div>
+          <div class="field"><label>后台刷新间隔（秒）</label><input v-model.number="s.workbuddy_routing.refresh_interval_seconds" type="number" min="30" max="600"/><div class="hint">必须小于缓存最大年龄。</div></div>
+        </div>
+        <p class="hint">同手动优先级内，优先使用更早到期的可用额度。账号内实际扣包顺序由上游决定；缓存不可信时使用现有策略。其他通道不受影响。</p>
+        <button class="btn s" @click="previewRouting" :disabled="routeBusy">{{routeBusy?'读取中':'预览已保存的路由策略'}}</button>
+        <template v-if="routePreview">
+          <div class="status-line" style="margin-top:12px"><span class="tag">已保存：{{routePreview.config.mode==='expiry_first'?'临期额度优先':'现有策略'}}</span><span class="tag">预计账号 {{routePreview.selected_account_id?'#'+routePreview.selected_account_id:'无可用账号'}}</span><span class="hint">预览不会切换账号或刷新额度。</span></div>
+          <div class="table-scroll" v-if="routePreview.accounts.length"><table class="mini-table"><thead><tr><th>账号</th><th>优先级</th><th>路由依据</th><th>最早临期</th><th>保守剩余额度</th><th>缓存年龄</th></tr></thead><tbody><tr v-for="a in routePreview.accounts" :key="a.account_id"><td>#{{a.account_id}} <span class="tag" v-if="a.account_id===routePreview.selected_account_id">预计选中</span></td><td>{{a.priority}}</td><td>{{routeReasons[a.reason]||a.reason}}</td><td>{{routingTime(a.expire_ts)}}</td><td>{{a.effective_remaining??'—'}}</td><td>{{a.age_seconds==null?'—':Math.floor(a.age_seconds)+' 秒'}}</td></tr></tbody></table></div>
+          <div class="hint" v-else style="margin-top:8px">暂无 WorkBuddy 账号。</div>
+        </template>
       </div>
     </div>
 

@@ -793,10 +793,67 @@ def get_account_resource_cache(account_id: int) -> Optional[dict]:
         payload = json.loads(row["payload"] or "{}")
     except (json.JSONDecodeError, TypeError):
         return None
+    if not isinstance(payload, dict):
+        return None
     payload["cached"] = True
     payload["cache_updated_at"] = int(row["updated_at"] or payload.get("updated_at") or 0)
     payload["age_seconds"] = max(0, int(time.time()) - int(payload["cache_updated_at"] or 0))
     return payload
+
+
+def get_account_resource_caches(account_ids: list[int]) -> dict[int, dict]:
+    if not account_ids:
+        return {}
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT account_id, payload, updated_at FROM account_resource_cache "
+            "WHERE account_id IN (" + ",".join("?" for _ in account_ids) + ")",
+            account_ids,
+        ).fetchall()
+    result = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            if not isinstance(payload, dict):
+                continue
+            payload["cache_updated_at"] = row["updated_at"]
+            result[row["account_id"]] = payload
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return result
+
+
+def mark_resource_refresh_failed(account_id: int):
+    """Retain display data and its successful timestamp, but revoke routing trust."""
+    with _lock:
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT payload FROM account_resource_cache WHERE account_id=?", (account_id,)
+            ).fetchone()
+            if not row:
+                return
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                return
+            if not isinstance(payload, dict):
+                return
+            payload.update(route_last_attempt_ok=False, route_last_attempt_at=int(time.time()))
+            conn.execute("UPDATE account_resource_cache SET payload=? WHERE account_id=?",
+                         (json.dumps(payload, ensure_ascii=False), account_id))
+            conn.commit()
+
+
+def set_settings(values: dict):
+    with _lock:
+        with connection() as conn:
+            conn.executemany(
+                "INSERT INTO settings (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [(key, json.dumps(value) if not isinstance(value, str) else value)
+                 for key, value in values.items()],
+            )
+            conn.commit()
 
 
 def upsert_account_checkin_cache(account_id: int, payload: dict):

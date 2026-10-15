@@ -495,7 +495,12 @@ async def claim_one(account: dict) -> dict:
         return result
     result = await auth_manager.claim_daily_checkin(account)
     if result.get("ok"):
-        result["resources"] = await auth_manager.fetch_account_resources(account, force=True)
+        import routing_refresh
+
+        if routing_refresh.notify(account["id"]):
+            result["resources_pending"] = True
+        else:
+            result["resources"] = await auth_manager.fetch_account_resources(account, force=True)
     return result
 
 

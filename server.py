@@ -12,6 +12,7 @@ FastAPI 应用，包含：
 import argparse
 import asyncio
 import contextvars
+from contextlib import asynccontextmanager
 import hashlib
 import ipaddress
 import json
@@ -49,6 +50,8 @@ from reasoning_controls import (
 )
 from version import VERSION
 import self_update
+import account_routing
+import routing_refresh
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -73,7 +76,18 @@ def _cors_origins() -> list[str]:
     return [origin.strip() for origin in value.split(",") if origin.strip()]
 
 
-app = FastAPI(title="Buddy 2 API", version=VERSION)
+@asynccontextmanager
+async def lifespan(app):
+    worker = routing_refresh.RoutingRefresher()
+    app.state.routing_refresher = worker
+    worker.start()
+    try:
+        yield
+    finally:
+        await worker.stop()
+
+
+app = FastAPI(title="Buddy 2 API", version=VERSION, lifespan=lifespan)
 _CORS_ORIGINS = _cors_origins()
 
 app.add_middleware(
@@ -1018,7 +1032,20 @@ async def admin_apply_update(authorization: str | None = Header(default=None)):
 @app.get("/admin/settings")
 async def admin_get_settings(authorization: str | None = Header(default=None)):
     _check_admin(authorization)
-    return db.get_all_settings()
+    settings = db.get_all_settings()
+    try:
+        settings[account_routing.SETTING] = account_routing.normalize_config(settings.get(account_routing.SETTING))
+    except (ValueError, TypeError):
+        settings[account_routing.SETTING] = dict(account_routing.DEFAULTS)
+    return settings
+
+
+@app.get("/admin/routing/preview")
+async def admin_routing_preview(channel: str = "workbuddy", authorization: str | None = Header(default=None)):
+    _check_admin(authorization)
+    if channel != "workbuddy":
+        raise HTTPException(status_code=400, detail="Routing preview supports WorkBuddy only")
+    return auth_manager.routing_preview()
 
 
 @app.put("/admin/settings")
@@ -1028,10 +1055,17 @@ async def admin_update_settings(
 ):
     _check_admin(authorization)
     data = await _read_json_object(request)
-    allowed_settings = {"backend_url", "default_domain", "timeout"}
+    allowed_settings = {"backend_url", "default_domain", "timeout", account_routing.SETTING}
     unknown = set(data) - allowed_settings
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unsupported settings: {', '.join(sorted(unknown))}")
+    if account_routing.SETTING in data:
+        try:
+            if data[account_routing.SETTING] is None:
+                raise ValueError("workbuddy_routing must be an object")
+            data[account_routing.SETTING] = account_routing.normalize_config(data[account_routing.SETTING])
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "timeout" in data:
         try:
             data["timeout"] = max(5, min(600, int(data["timeout"])))
@@ -1042,8 +1076,9 @@ async def admin_update_settings(
         if not backend_url.startswith("https://"):
             raise HTTPException(status_code=400, detail="backend_url must use HTTPS")
         data["backend_url"] = backend_url
-    for k, v in data.items():
-        db.set_setting(k, v)
+    db.set_settings(data)
+    if account_routing.SETTING in data:
+        routing_refresh.notify()
     return {"status": "ok"}
 
 

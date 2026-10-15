@@ -13,9 +13,11 @@ import asyncio
 import json
 import math
 import os
+import sqlite3
 import sys
 import threading
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -24,6 +26,7 @@ import httpx
 
 import database as db
 import fingerprint
+import account_routing
 
 try:
     import wb_atrest
@@ -47,6 +50,7 @@ _route_lock = threading.Lock()
 _sticky_account_id: dict[str, int] = {}
 _failure_lock = threading.Lock()
 _account_failures: dict[int, tuple[int, float]] = {}
+_resource_locks = weakref.WeakKeyDictionary()
 
 
 def _get_token_lock(aid: int) -> asyncio.Lock:
@@ -715,6 +719,11 @@ def _resource_failure(
     status_code: int = 0,
     allow_stale: bool = True,
 ) -> dict:
+    if account.get("id"):
+        try:
+            db.mark_resource_refresh_failed(account["id"])
+        except sqlite3.Error:
+            pass
     cached = db.get_account_resource_cache(account.get("id")) if allow_stale and account.get("id") else None
     if cached:
         cached["stale"] = True
@@ -755,11 +764,48 @@ async def fetch_account_resources(
     force: bool = False,
     max_age_seconds: int = 60,
     allow_stale: bool = True,
+    routing_only: bool = False,
+) -> dict:
+    aid = account.get("id")
+    if not aid:
+        return await _fetch_account_resources_unlocked(
+            account, force=force, max_age_seconds=max_age_seconds, allow_stale=allow_stale
+        )
+    loop = asyncio.get_running_loop()
+    locks = _resource_locks.setdefault(loop, {})
+    lock = locks.setdefault((str(db.DB_PATH), aid), asyncio.Lock())
+    async with lock:
+        fresh = db.get_account(aid) or account
+        if routing_only:
+            import providers
+
+            if (fresh.get("status") != "active" or not providers.is_channel_enabled("workbuddy")
+                    or account_routing.load_config()["mode"] != "expiry_first"):
+                return {"ok": False, "message": "routing refresh is disabled", "packages": []}
+        if fresh.get("status") == "inactive":
+            return _resource_failure(fresh, message="account is inactive", allow_stale=allow_stale)
+        try:
+            return await _fetch_account_resources_unlocked(
+                fresh, force=force, max_age_seconds=max_age_seconds, allow_stale=allow_stale
+            )
+        except (Exception, asyncio.CancelledError):
+            try:
+                db.mark_resource_refresh_failed(aid)
+            except sqlite3.Error:
+                pass
+            raise
+
+
+async def _fetch_account_resources_unlocked(
+    account: dict, *, force: bool, max_age_seconds: int, allow_stale: bool,
 ) -> dict:
     """查询官方额度资源，只返回安全摘要和额度包明细。"""
     if account.get("id") and not force:
         cached = db.get_account_resource_cache(account["id"])
-        if cached and int(cached.get("age_seconds") or 0) <= max_age_seconds:
+        if (cached and "route_usage_baseline" in cached and cached.get("route_last_attempt_ok") is True
+                and cached.get("ok") is True
+                and 0 < cached.get("cache_updated_at", 0) <= time.time()
+                and int(cached.get("age_seconds") or 0) <= max_age_seconds):
             cached["stale"] = False
             return cached
 
@@ -772,7 +818,7 @@ async def fetch_account_resources(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=request_timeout(25)) as c:
+        async with httpx.AsyncClient(timeout=min(25, request_timeout(25))) as c:
             r = await c.post(f"{backend_url(account)}/v2/billing/meter/get-user-resource", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
@@ -842,6 +888,9 @@ async def fetch_account_resources(
         "age_seconds": 0,
         "packages": packages,
         "expiring_packages": expiring_packages,
+        "route_usage_baseline": account.get("total_credits", 0),
+        "route_last_attempt_at": now_ts,
+        "route_last_attempt_ok": True,
     }
     if ok and account.get("id"):
         db.upsert_account_resource_cache(account["id"], result)
@@ -1033,8 +1082,9 @@ def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> O
     if not candidates:
         return None
 
-    highest_priority = max(_route_priority(a) for a in candidates)
-    top_candidates = [a for a in candidates if _route_priority(a) == highest_priority]
+    config = account_routing.load_config() if provider == "workbuddy" else dict(account_routing.DEFAULTS)
+    snapshots = account_routing.read_snapshots(candidates) if config["mode"] == "expiry_first" else {}
+    top_candidates, _ = account_routing.best_group(candidates, config, snapshots)
     with _route_lock:
         sticky_id = _sticky_account_id.get(provider)
         if sticky_id is not None:
@@ -1045,6 +1095,36 @@ def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> O
         chosen = sorted(top_candidates, key=_route_sort_key)[0]
         _sticky_account_id[provider] = chosen["id"]
         return chosen
+
+
+def routing_preview() -> dict:
+    config = account_routing.load_config()
+    accounts = db.list_accounts(provider="workbuddy")
+    candidates = [a for a in accounts if a.get("status") == "active"
+                  and not account_is_cooling_down(a["id"])]
+    snapshots = account_routing.read_snapshots(candidates) if config["mode"] == "expiry_first" else {}
+    top, summaries = account_routing.best_group(candidates, config, snapshots)
+    highest = max((_route_priority(a) for a in candidates), default=None)
+    with _route_lock:
+        sticky_id = _sticky_account_id.get("workbuddy")
+    chosen = next((a for a in top if a["id"] == sticky_id), None)
+    if chosen is None and top:
+        chosen = min(top, key=_route_sort_key)
+    rows = []
+    for account in accounts:
+        summary = summaries.get(account["id"], {})
+        reason = summary.get("reason", "legacy" if config["mode"] == "legacy" else "lower_manual_priority")
+        if account.get("status") != "active":
+            reason = "inactive"
+        elif account_is_cooling_down(account["id"]):
+            reason = "cooldown"
+        elif highest is not None and _route_priority(account) < highest:
+            reason = "lower_manual_priority"
+        rows.append({"account_id": account["id"], "priority": _route_priority(account),
+                     **summary, "reason": reason,
+                     "in_best_group": any(a["id"] == account["id"] for a in top)})
+    return {"channel": "workbuddy", "config": config, "sticky_account_id": sticky_id,
+            "selected_account_id": chosen["id"] if chosen else None, "accounts": rows}
 
 
 async def pick_account_with_fallback(
