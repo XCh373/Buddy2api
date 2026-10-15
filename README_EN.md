@@ -116,6 +116,14 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
 ```
 
+## Expiring credit routing
+
+In Settings, use the WorkBuddy account routing controls to enable expiry-first routing. It is off by default. Manual account priority takes precedence; within that priority, accounts with earlier expiring usable credits are preferred. Accounts with the same expiry retain stickiness. Other channels keep their existing routing.
+
+Defaults: a 30-day expiry window, resource refresh every 120 seconds, and a maximum cache age of 300 seconds. Failed or stale snapshots and conservatively exhausted credits lose their expiry advantage; routing falls back to the existing policy. The saved-policy preview explains the expected account without changing stickiness or querying resources.
+
+The upstream owns deduction within an account. Local consumption estimates do not capture all external or in-flight usage. Background resource queries may refresh credentials; separate local databases do not isolate the same upstream account across instances. Disabling the policy stops new policy-specific background queries.
+
 ## Environment
 
 `CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
