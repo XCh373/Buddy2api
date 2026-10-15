@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import os
 import secrets
+import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import database as db
@@ -57,6 +59,69 @@ def checkin_gap_seconds() -> float:
         return max(0, int(raw)) / 1000.0
     except (TypeError, ValueError):
         return 0.8
+
+
+def as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_override(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return as_bool(raw, False)
+
+
+def _saved_hour(env_name: str, setting_name: str, default: int) -> int:
+    raw = os.environ.get(env_name)
+    if raw is not None and raw.strip() != "":
+        try:
+            return max(0, min(23, int(raw)))
+        except ValueError:
+            pass
+    try:
+        return max(0, min(23, int(db.get_setting(setting_name, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def keepalive_enabled() -> bool:
+    override = _env_override("CB_GATEWAY_KEEPALIVE")
+    if override is not None:
+        return override
+    return as_bool(db.get_setting("keepalive_enabled", False), False)
+
+
+def keepalive_hour() -> int:
+    return _saved_hour("CB_GATEWAY_KEEPALIVE_HOUR", "keepalive_hour", 22)
+
+
+def auto_checkin_enabled() -> bool:
+    override = _env_override("CB_GATEWAY_AUTO_CHECKIN")
+    if override is not None:
+        return override
+    return as_bool(db.get_setting("auto_checkin_enabled", False), False)
+
+
+def auto_checkin_hour() -> int:
+    return _saved_hour("CB_GATEWAY_AUTO_CHECKIN_HOUR", "auto_checkin_hour", 9)
+
+
+def automation_due(now: datetime, hour: int) -> bool:
+    """Daily jobs fire only near the top of the configured hour."""
+    return now.hour == int(hour) and now.minute < 10
+
+
+def seconds_until_hour(hour: int, now: datetime | None = None) -> float:
+    moment = now or datetime.now()
+    target = moment.replace(hour=int(hour), minute=0, second=0, microsecond=0)
+    if target <= moment:
+        target += timedelta(days=1)
+    return max(1.0, (target - moment).total_seconds())
 
 
 def path_hash(path: str) -> str:
@@ -579,3 +644,233 @@ async def checkin_all(channel_filter: list[str] | None = None) -> dict:
         "skipped": skipped,
         "results": results,
     }
+
+
+def _account_label(account: dict) -> str:
+    return account.get("nickname") or account.get("name") or str(account.get("id"))
+
+
+async def refresh_one(account: dict, *, allow_inactive: bool = True) -> dict:
+    channel = str(account.get("provider") or "workbuddy")
+    base = {
+        "account_id": account.get("id"),
+        "account_name": _account_label(account),
+        "provider": channel,
+    }
+    if not allow_inactive and account.get("status") == "inactive":
+        return {**base, "ok": False, "skipped": True, "reason": "inactive", "message": "账号已禁用，未刷新", "status": "inactive"}
+    if channel == "workbuddy":
+        result = await auth_manager.refresh_token_result(account)
+        result["status_text"] = "ok" if result.get("ok") else "failed"
+        return result
+    provider = providers.get_provider(channel)
+    if provider is None:
+        return {
+            **base,
+            "ok": False,
+            "skipped": True,
+            "reason": "disabled_channel",
+            "message": f"通道 {channel} 未启用",
+            "status": account.get("status") or "",
+        }
+    refresh = getattr(provider, "refresh", None)
+    if refresh is None:
+        return {
+            **base,
+            "ok": False,
+            "skipped": True,
+            "reason": "unsupported",
+            "message": f"通道 {channel} 不支持保活",
+            "status": account.get("status") or "",
+        }
+    try:
+        await refresh(account)
+    except Exception as exc:
+        text = " ".join(str(exc).split())[:180] or "刷新失败"
+        return {**base, "ok": False, "reason": "rejected", "message": text, "status": account.get("status") or ""}
+    fresh = db.get_account(account["id"]) or account
+    return {**base, "ok": True, "reason": "refreshed", "message": "已续期", "status": fresh.get("status") or "active"}
+
+
+_keepalive_guard = asyncio.Lock()
+_keepalive_running = False
+_keepalive_task: asyncio.Task | None = None
+_keepalive_stop: asyncio.Event | None = None
+
+
+def _job_busy(source: str) -> dict:
+    return {
+        "ok": False,
+        "running": True,
+        "source": source,
+        "message": "已有保活或领取任务在进行",
+        "total": 0,
+        "refreshed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "results": [],
+    }
+
+
+async def _begin_job(source: str) -> dict | None:
+    global _keepalive_running
+    async with _keepalive_guard:
+        if _keepalive_running:
+            return _job_busy(source)
+        _keepalive_running = True
+        return None
+
+
+async def _end_job() -> None:
+    global _keepalive_running
+    async with _keepalive_guard:
+        _keepalive_running = False
+
+
+async def keepalive_all(
+    channel_filter: list[str] | None = None,
+    source: str = "manual",
+    *,
+    claim: bool = False,
+) -> dict:
+    busy = await _begin_job(source)
+    if busy:
+        return busy
+    try:
+        wanted = set(channel_filter) if channel_filter else None
+        results = []
+        gap = checkin_gap_seconds()
+        first = True
+        for channel in providers.enabled_provider_ids():
+            if wanted is not None and channel not in wanted:
+                continue
+            accounts = await _channel_accounts(channel, status="")
+            for account in accounts:
+                if not first and gap:
+                    await asyncio.sleep(gap)
+                first = False
+                result = await refresh_one(account, allow_inactive=False)
+                result["channel"] = channel
+                result["status_text"] = "ok" if result.get("ok") else "failed"
+                results.append(result)
+        refreshed = sum(1 for row in results if row.get("ok"))
+        skipped = sum(1 for row in results if row.get("skipped"))
+        failed = sum(1 for row in results if not row.get("ok") and not row.get("skipped"))
+        claim_summary = None
+        if claim:
+            claim_summary = await checkin_all(channel_filter)
+        claim_failed = int((claim_summary or {}).get("failed") or 0)
+        claimed = int((claim_summary or {}).get("claimed") or 0)
+        already = int((claim_summary or {}).get("already_claimed") or 0)
+        if claim_summary:
+            message = f"已续期 {refreshed} · 领取 {claimed} · 已领 {already} · 失败 {failed + claim_failed}"
+        else:
+            message = f"已续期 {refreshed} · 失败 {failed} · 跳过 {skipped}"
+        return {
+            "ok": failed == 0 and claim_failed == 0,
+            "running": False,
+            "source": source,
+            "message": message,
+            "total": len(results),
+            "refreshed": refreshed,
+            "failed": failed,
+            "skipped": skipped,
+            "claimed": claimed,
+            "already_claimed": already,
+            "claim_failed": claim_failed,
+            "claim": claim_summary,
+            "results": results,
+        }
+    finally:
+        await _end_job()
+
+
+def _log_keepalive(summary: dict) -> None:
+    sys.stderr.write(
+        "[keepalive] source={source} refreshed={refreshed} failed={failed} skipped={skipped}\n".format(
+            source=summary.get("source") or "manual",
+            refreshed=summary.get("refreshed") or 0,
+            failed=summary.get("failed") or 0,
+            skipped=summary.get("skipped") or 0,
+        )
+    )
+
+
+async def _run_keepalive_safe(source: str) -> None:
+    if not keepalive_enabled():
+        return
+    try:
+        _log_keepalive(await keepalive_all(source=source, claim=False))
+    except Exception as exc:
+        sys.stderr.write(f"[keepalive] {source} failed: {type(exc).__name__}\n")
+
+
+async def _run_checkin_safe(source: str) -> None:
+    if not auto_checkin_enabled():
+        return
+    busy = await _begin_job(source)
+    if busy:
+        return
+    try:
+        summary = await checkin_all()
+        sys.stderr.write(
+            "[checkin] source={source} claimed={claimed} already={already} failed={failed}\n".format(
+                source=source,
+                claimed=summary.get("claimed") or 0,
+                already=summary.get("already_claimed") or 0,
+                failed=summary.get("failed") or 0,
+            )
+        )
+    except Exception as exc:
+        sys.stderr.write(f"[checkin] {source} failed: {type(exc).__name__}\n")
+    finally:
+        await _end_job()
+
+
+async def keepalive_loop(stop: asyncio.Event) -> None:
+    """Idle until a saved automation hour. Nothing runs unless that switch is on."""
+    db.init_db()
+    fired: set[str] = set()
+    while not stop.is_set():
+        now = datetime.now()
+        today = now.date().isoformat()
+        fired = {item for item in fired if item.startswith(today)}
+        if keepalive_enabled() and automation_due(now, keepalive_hour()):
+            slot = f"{today}:keepalive:{keepalive_hour()}"
+            if slot not in fired:
+                fired.add(slot)
+                await _run_keepalive_safe("schedule")
+        if auto_checkin_enabled() and automation_due(now, auto_checkin_hour()):
+            slot = f"{today}:checkin:{auto_checkin_hour()}"
+            if slot not in fired:
+                fired.add(slot)
+                await _run_checkin_safe("schedule")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
+def start_keepalive() -> None:
+    global _keepalive_task, _keepalive_stop
+    if _keepalive_task and not _keepalive_task.done():
+        return
+    _keepalive_stop = asyncio.Event()
+    _keepalive_task = asyncio.create_task(keepalive_loop(_keepalive_stop), name="keepalive")
+
+
+async def stop_keepalive() -> None:
+    global _keepalive_task, _keepalive_stop
+    if _keepalive_stop is not None:
+        _keepalive_stop.set()
+    task = _keepalive_task
+    _keepalive_task = None
+    _keepalive_stop = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

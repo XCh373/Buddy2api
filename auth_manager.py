@@ -452,49 +452,201 @@ def auto_scan_and_import(auth_dir: Optional[str] = None) -> dict:
 
 
 # ============================================================
-# Token 刷新
+# Token 刷新 / 保活
 # ============================================================
+
+SESSION_DEAD_THRESHOLD = 3
+_session_dead_lock = threading.Lock()
+_session_dead_counts: dict[int, int] = {}
+
+
+def reset_session_dead_counts() -> None:
+    with _session_dead_lock:
+        _session_dead_counts.clear()
+
+
+def session_dead_count(aid: int) -> int:
+    with _session_dead_lock:
+        return _session_dead_counts.get(int(aid), 0)
+
+
+def _note_session_dead(aid: int) -> int:
+    with _session_dead_lock:
+        count = _session_dead_counts.get(int(aid), 0) + 1
+        _session_dead_counts[int(aid)] = count
+        return count
+
+
+def clear_session_dead(aid: int) -> None:
+    with _session_dead_lock:
+        _session_dead_counts.pop(int(aid), None)
+
+
+def epoch_ms(value, *, now_ms: int | None = None, seconds=None) -> int:
+    """Normalize upstream expiry to milliseconds. Seconds-since-epoch values are scaled."""
+    moment = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        number = 0
+    if number > 0:
+        return number * 1000 if number < 10**12 else number
+    try:
+        extra = int(seconds or 0)
+    except (TypeError, ValueError):
+        extra = 0
+    if extra > 0:
+        return moment + extra * 1000
+    return 0
+
+
+def _safe_refresh_message(text: str, fallback: str) -> str:
+    value = " ".join(str(text or "").split())
+    lowered = value.lower()
+    if not value or "accesstoken" in lowered or "refreshtoken" in lowered or "bearer " in lowered:
+        return fallback
+    return value[:180]
+
+
+def _is_session_dead(status_code: int, payload, message: str) -> bool:
+    parts = [str(message or "")]
+    if isinstance(payload, dict):
+        parts.append(str(payload.get("code") or ""))
+        parts.append(str(payload.get("msg") or payload.get("message") or ""))
+        data = payload.get("data")
+        if isinstance(data, dict):
+            parts.append(str(data.get("code") or ""))
+            parts.append(str(data.get("msg") or ""))
+    text = " ".join(parts)
+    return "12153" in text or "offline user session not found" in text.lower()
+
+
+def _refresh_view(account: dict, *, ok: bool, reason: str, message: str, status_code: int = 0) -> dict:
+    fresh = db.get_account(account["id"]) or account
+    return {
+        "ok": ok,
+        "account_id": account.get("id"),
+        "account_name": account.get("nickname") or account.get("name") or str(account.get("id")),
+        "provider": account.get("provider") or "workbuddy",
+        "reason": reason,
+        "message": message,
+        "status": fresh.get("status") or account.get("status") or "",
+        "status_code": status_code,
+        "session_dead_count": session_dead_count(account["id"]),
+        "skipped": reason in {"inactive", "missing_refresh"},
+    }
+
+
+async def refresh_token_result(account: dict) -> dict:
+    """Refresh one WorkBuddy login. Transient failures keep the current status."""
+    aid = int(account["id"])
+    if not str(account.get("refresh_token") or "").strip():
+        return _refresh_view(account, ok=False, reason="missing_refresh", message="没有 refresh token，需要重新登录")
+
+    lock = _get_token_lock(aid)
+    async with lock:
+        current = db.get_account(aid) or account
+        headers = build_refresh_headers(current)
+        url = f"{backend_url(current)}/v2/plugin/auth/token/refresh"
+        try:
+            async with httpx.AsyncClient(timeout=request_timeout(15)) as client:
+                response = await client.post(url, headers=headers, json={})
+            data = response.json()
+            status_code = response.status_code
+        except (httpx.HTTPError, ValueError) as exc:
+            print(f"[auth_manager] 刷新 token 网络失败 (account={aid}): {type(exc).__name__}", file=sys.stderr)
+            return _refresh_view(current, ok=False, reason="transient", message="网络或响应异常，账号状态未改")
+
+        message = ""
+        if isinstance(data, dict):
+            message = str(data.get("msg") or data.get("message") or "")
+        new_auth = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else None
+        code = data.get("code") if isinstance(data, dict) else None
+        access_token = str((new_auth or {}).get("accessToken") or "").strip()
+        failed = (
+            not isinstance(data, dict)
+            or status_code >= 300
+            or code not in {0, "0"}
+            or not access_token
+        )
+        if failed:
+            safe = _safe_refresh_message(message, "上游拒绝刷新")
+            if _is_session_dead(status_code, data, message):
+                count = _note_session_dead(aid)
+                if count >= SESSION_DEAD_THRESHOLD:
+                    db.update_account(aid, {"status": "expired"})
+                    text = f"登录态已失效（连续 {count} 次），请重新浏览器登录"
+                else:
+                    text = f"登录态暂时失效（{count}/{SESSION_DEAD_THRESHOLD}），未禁用"
+                print(f"[auth_manager] 刷新 token session dead (account={aid}): {count}", file=sys.stderr)
+                return _refresh_view(current, ok=False, reason="session_dead", message=text, status_code=status_code)
+            if status_code >= 500 or status_code == 429 or status_code == 0:
+                reason = "transient"
+                text = "上游暂时失败，账号状态未改"
+            else:
+                reason = "rejected"
+                text = safe
+            print(f"[auth_manager] 刷新 token 失败 (account={aid}): {reason}", file=sys.stderr)
+            return _refresh_view(current, ok=False, reason=reason, message=text, status_code=status_code)
+
+        now_ms = int(time.time() * 1000)
+        refresh_token = str(new_auth.get("refreshToken") or "").strip() or str(current.get("refresh_token") or "")
+        expires_at = epoch_ms(new_auth.get("expiresAt"), now_ms=now_ms, seconds=new_auth.get("expiresIn"))
+        refresh_expires_at = epoch_ms(
+            new_auth.get("refreshExpiresAt"), now_ms=now_ms, seconds=new_auth.get("refreshExpiresIn")
+        )
+        next_status = "inactive" if current.get("status") == "inactive" else "active"
+        update_data = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at or int(current.get("expires_at") or 0),
+            "refresh_expires_at": refresh_expires_at or int(current.get("refresh_expires_at") or 0),
+            "domain": str(new_auth.get("domain") or current.get("domain") or DEFAULT_DOMAIN),
+            "status": next_status,
+        }
+        session_state = str(new_auth.get("sessionState") or "").strip()
+        if session_state:
+            update_data["session_state"] = session_state
+        db.update_account(aid, update_data)
+        clear_session_dead(aid)
+        return _refresh_view(current, ok=True, reason="refreshed", message="已续期", status_code=status_code)
+
 
 async def refresh_token(account: dict) -> bool:
     """调后端刷新 token，写回数据库。返回是否成功。"""
-    aid = account["id"]
-    lock = _get_token_lock(aid)
-    async with lock:
-        headers = build_refresh_headers(account)
-        url = f"{backend_url(account)}/v2/plugin/auth/token/refresh"
+    return bool((await refresh_token_result(account)).get("ok"))
 
-        try:
-            async with httpx.AsyncClient(timeout=request_timeout(15)) as c:
-                r = await c.post(url, headers=headers, json={})
-            data = r.json()
-        except (httpx.HTTPError, ValueError) as e:
-            print(f"[auth_manager] 刷新 token 网络失败 (account={aid}): {e}", file=sys.stderr)
-            return False
 
-        if not isinstance(data, dict) or data.get("code") != 0 or not data.get("data"):
-            message = data.get("msg", "upstream rejected refresh") if isinstance(data, dict) else "invalid response"
-            print(f"[auth_manager] 刷新 token 失败 (account={aid}): {str(message)[:240]}", file=sys.stderr)
-            # 标记账号为过期
-            db.update_account(aid, {"status": "expired"})
-            return False
-
-        new_auth = data["data"]
-        now_ms = int(time.time() * 1000)
-        next_status = "inactive" if account.get("status") == "inactive" else "active"
-        update_data = {
-            "access_token": new_auth.get("accessToken", ""),
-            "refresh_token": new_auth.get("refreshToken", ""),
-            "expires_at": new_auth.get("expiresAt") or (
-                now_ms + new_auth.get("expiresIn", 0) * 1000
-            ),
-            "refresh_expires_at": new_auth.get("refreshExpiresAt") or (
-                now_ms + new_auth.get("refreshExpiresIn", 0) * 1000
-            ),
-            "domain": new_auth.get("domain", DEFAULT_DOMAIN),
-            "status": next_status,
+def upsert_login_account(parsed: dict) -> dict:
+    """Insert or update a WorkBuddy account from browser login. Keeps weight and priority."""
+    uid = str(parsed.get("uid") or "").strip()
+    existing = next(
+        (row for row in db.list_accounts(provider="workbuddy") if row.get("uid") == uid),
+        None,
+    )
+    if existing:
+        patch = {
+            "access_token": parsed.get("access_token") or existing.get("access_token") or "",
+            "refresh_token": parsed.get("refresh_token") or existing.get("refresh_token") or "",
+            "expires_at": parsed.get("expires_at") or existing.get("expires_at") or 0,
+            "refresh_expires_at": parsed.get("refresh_expires_at") or existing.get("refresh_expires_at") or 0,
+            "domain": parsed.get("domain") or existing.get("domain") or DEFAULT_DOMAIN,
+            "status": "active",
         }
-        db.update_account(aid, update_data)
-        return True
+        if parsed.get("nickname"):
+            patch["nickname"] = parsed["nickname"]
+            patch["name"] = parsed.get("name") or parsed["nickname"]
+        if parsed.get("enterprise_id"):
+            patch["enterprise_id"] = parsed["enterprise_id"]
+        if parsed.get("phone"):
+            patch["phone"] = parsed["phone"]
+        if parsed.get("session_state"):
+            patch["session_state"] = parsed["session_state"]
+        db.update_account(existing["id"], patch)
+        clear_session_dead(existing["id"])
+        return {"id": existing["id"], "updated": True}
+    aid = db.add_account({**parsed, "provider": "workbuddy", "status": "active"})
+    return {"id": aid, "updated": False}
 
 
 def is_token_expired(account: dict) -> bool:
@@ -1165,6 +1317,12 @@ def get_account_status(account: dict) -> dict:
     remaining_hours = 0
     if account.get("expires_at"):
         remaining_hours = max(0, int((account["expires_at"] - now_ms) / 1000 / 3600))
+    refresh_expires_at = int(account.get("refresh_expires_at") or 0)
+    refresh_known = refresh_expires_at > 0
+    refresh_expired = bool(refresh_known and now_ms >= refresh_expires_at)
+    refresh_remaining_hours = (
+        max(0, int((refresh_expires_at - now_ms) / 1000 / 3600)) if refresh_known else 0
+    )
     credit_snapshot = max(0.0, float(account.get("credit_limit") or 0))
     credit_baseline = max(0.0, float(account.get("credit_baseline") or 0))
     total_credits = round(float(account.get("total_credits") or 0), 4)
@@ -1185,6 +1343,9 @@ def get_account_status(account: dict) -> dict:
         "priority": int(account.get("priority") or 0),
         "token_expired": expired,
         "remaining_hours": remaining_hours,
+        "refresh_known": refresh_known,
+        "refresh_expired": refresh_expired,
+        "refresh_remaining_hours": refresh_remaining_hours,
         "total_requests": account.get("total_requests", 0),
         "total_tokens": account.get("total_tokens", 0),
         "total_credits": total_credits,
