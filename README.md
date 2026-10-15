@@ -4,7 +4,9 @@
 
 > 把本机已经登录的消费级 AI 客户端，接成 OpenAI 兼容接口，给 Codex、OpenCode、Cherry Studio、NextChat 等用。默认打开 Work Buddy / CodeBuddy、QClaw、千问办公（QwenWork）、TraeWork 四个通道；管理页下拉选其中一个。一次请求只走一个通道。
 
-当前版本 **2.1.17**。这个项目只适合本机自用，不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
+当前版本 **2.1.18**。这个项目只供你本人持有的账号在本机使用。不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
+
+**仅限自己的账号。严禁使用接码平台、批量注册或任何批量方式薅羊毛。** 不要把网关公开给别人用，也不要代领或倒卖额度。
 
 默认本机启动会自动打开管理页，无需填写管理 Token，重启后已有页面仍可直接使用。重复启动会打开已运行的同一实例；同一数据库不能同时由多个实例使用。后台服务可加 `--no-browser`。`start.sh` 和 `start-launchd.sh` 与直接运行 `python server.py` 一样，不会自动读取 `.admin_token` 文件；显式传入 `--admin-token` 或设置 `CB_GATEWAY_ADMIN_TOKEN` 才启用令牌鉴权，非本机监听必须配置。启用令牌模式后需在管理页设置中填写。客户端 API Key 和上游账号授权不受影响。
 
@@ -103,7 +105,7 @@ python server.py
 
 本机管理页自动授权，不用粘贴 Token，也不依赖管理 Cookie。
 
-1. 打开「账号」，点击「一键导入全部通道」读取各启用通道的默认登录目录；也可先选择通道，再点击「导入当前通道」。自定义路径仅用于当前通道，留空使用默认目录，切换通道会清空路径。导入后逐通道显示结果，未登录的通道会跳过。
+1. 打开「账号」。WorkBuddy 可以点「浏览器登录」，在官方页面登录后自动入库，国内和国际站都能选。也可以点「一键导入全部通道」读取各启用通道的默认登录目录；自定义路径仅用于当前通道。未登录的通道会跳过。已入库的号用「一键保活」续期并领取今日积分；只想领取时用「一键领取今日积分」。定时保活和定时领取在设置页，默认关闭，要手动打开并保存。
 2. 点该账号的「测试」，能返回一句话就说明这条通道通了。
 3. 打开「API Keys」，**先选同一个通道**再创建。给 Codex 用时 Key 类型选 Codex，接口用 `/v1/responses`。创建后可以再显示、复制完整 Key。
 4. 在客户端里填：
@@ -249,7 +251,11 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 |---|---|
 | `CB_GATEWAY_PROVIDERS` | 启用哪些通道，逗号分隔。默认 `workbuddy,qclaw,qwenwork,traework`。只想留一家时再改 |
 | `CB_GATEWAY_AUTO_IMPORT` | 设 `1` 则启动时自动导入。默认 `0` |
-| `CB_GATEWAY_CHECKIN_GAP_MS` | 一键领取间隔，默认 `800` |
+| `CB_GATEWAY_CHECKIN_GAP_MS` | 一键领取和一键保活的账号间隔，默认 `800` |
+| `CB_GATEWAY_KEEPALIVE` | 设 `1` 强制打开定时保活，设 `0` 强制关闭。不设时跟随设置页，默认关闭 |
+| `CB_GATEWAY_KEEPALIVE_HOUR` | 定时保活的本地小时，默认 `22`。只在该小时前 10 分钟执行 |
+| `CB_GATEWAY_AUTO_CHECKIN` | 设 `1` 强制打开定时领取，设 `0` 强制关闭。不设时跟随设置页，默认关闭 |
+| `CB_GATEWAY_AUTO_CHECKIN_HOUR` | 定时领取的本地小时，默认 `9` |
 | `CB_GATEWAY_DEFAULT_REASONING_EFFORT` | WorkBuddy DeepSeek V4 Pro/Flash 的默认思考强度，支持 `low` / `high` / `max`，默认 `high`；设为 `off` 可关闭默认值。Responses 的 `reasoning.effort` 或 Chat Completions 的 `reasoning_effort` 会覆盖它 |
 | `CB_AUTH_DIR` | WorkBuddy 登录目录 |
 | `CB_QCLAW_AUTH_DIR` | QClaw 登录目录 |
