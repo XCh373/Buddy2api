@@ -44,6 +44,16 @@ class WorkBuddyProvider:
     async def has_usable_account(self) -> bool:
         return await self.pick_account_with_fallback() is not None
 
+    async def start_login(self, realm: str = "cn") -> dict:
+        from providers.workbuddy import oauth
+
+        return await oauth.start_login(realm)
+
+    async def poll_login(self, state: str) -> dict:
+        from providers.workbuddy import oauth
+
+        return await oauth.poll_login(state)
+
     async def chat_completions(self, payload: dict, api_key_info: dict | None) -> tuple:
         log_model = None
         info = api_key_info
