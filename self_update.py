@@ -16,7 +16,7 @@ import httpx
 from version import VERSION
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_REPO = "wicm84266964/Buddy2api"
+DEFAULT_REPO = "XCh373/Buddy2api"
 CACHE_OK_TTL = 600.0
 CACHE_FAIL_TTL = 60.0
 VERSION_RE = re.compile(r'^VERSION\s*=\s*["\']([^"\']+)["\']', re.M)

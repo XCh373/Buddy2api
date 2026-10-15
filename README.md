@@ -120,7 +120,7 @@ python server.py
 
 ### 更新
 
-管理页打开后会在后台核对远端版本（优先走 jsDelivr，不挡页面）。有新版本时顶栏出现「更新到 vx.y.z」，点一下会 `git pull --ff-only`、安装依赖并重启。查不到远端版本时不会报错。Docker、不是 git 克隆、或不在 `main` 上时，按钮会说明原因，仍可用下面的手动步骤。本机已是最新、只想看按钮时：`$env:CB_GATEWAY_FAKE_LATEST="9.9.9"` 再启动，点下去不会真的拉取或重启。
+管理页打开后会在后台核对远端版本（优先走 jsDelivr，不挡页面）。本 fork 默认检查 `XCh373/Buddy2api` 的 `main`；可通过环境变量 `CB_GATEWAY_UPDATE_REPO=owner/repo` 覆盖检查源。有新版本时顶栏出现「更新到 vx.y.z」，点一下会对当前分支配置的跟踪远端执行 `git pull --ff-only`、安装依赖并重启；本 fork 的 `main` 应跟踪 `origin/main`，且 `origin` 应指向你的 fork。检查源和实际拉取远端需要保持一致。查不到远端版本时不会报错。Docker、不是 git 克隆、或不在 `main` 上时，按钮会说明原因，仍可用下面的手动步骤。本机已是最新、只想看按钮时：`$env:CB_GATEWAY_FAKE_LATEST="9.9.9"` 再启动，点下去不会真的拉取或重启。
 
 先 `Ctrl+C` 停掉正在跑的服务：
 
