@@ -72,7 +72,7 @@ Later starts: `conda activate buddy2api` then `python server.py` in the project 
 
 ## Update
 
-The management page checks for a newer `main` in the background (jsDelivr first). A top-bar **Update to vx.y.z** button runs `git pull --ff-only`, reinstalls requirements, and restarts. A failed check stays silent. Docker images, zip copies, and non-`main` checkouts keep using a manual pull. To preview the button on an already-current install, start with `CB_GATEWAY_FAKE_LATEST=9.9.9`; the click does not pull or restart.
+The management page checks for a newer version in the background (jsDelivr first). This fork defaults to `XCh373/Buddy2api`'s `main`; override the check source with `CB_GATEWAY_UPDATE_REPO=owner/repo`. A top-bar **Update to vx.y.z** button runs `git pull --ff-only` from the current branch's configured tracking remote, reinstalls requirements, and restarts. For this fork, `main` should track `origin/main`, and `origin` should point to your fork so the version check and pull target stay aligned. A failed check stays silent. Docker images, zip copies, and non-`main` checkouts keep using a manual pull. To preview the button on an already-current install, start with `CB_GATEWAY_FAKE_LATEST=9.9.9`; the click does not pull or restart.
 
 ## Upgrade from 1.4.x
 
