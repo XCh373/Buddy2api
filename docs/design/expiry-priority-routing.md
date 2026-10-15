@@ -1,6 +1,6 @@
 # WorkBuddy 临期额度优先路由开发方案
 
-日期：2026-10-14。状态：用户已授权实施，功能实现与验收已完成；本方案记录设计约束，不代表已部署到日常服务。结果与剩余限制见 [验证记录](../verification/expiry-priority-routing.md)。
+日期：2026-10-14。状态：用户已授权实施，功能实现与验收已完成；本方案记录设计约束，当前运行与发布状态见 [验证记录](../verification/expiry-priority-routing.md)。
 
 ## 1. 目标与开发边界
 
@@ -21,7 +21,7 @@
 
 | 用途 | 当前状态 / 约定 |
 | --- | --- |
-| 日常服务目录 | 本地日常 worktree（`Buddy2api`），`main`，基线 `11853e3946844cbb17ac5e784966bb6efe26a8d0` |
+| 日常服务目录 | 本地日常 worktree（`Buddy2api`），`main`，实现前基线 `11853e3946844cbb17ac5e784966bb6efe26a8d0` |
 | 开发 worktree | 本地开发 worktree（`Buddy2api-dev`） |
 | 开发分支 | `feat/expiry-priority-routing`，从上述已提交基线创建 |
 | 日常端口 | `127.0.0.1:8787`，继续由原 launchd 配置启动 |
