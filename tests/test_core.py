@@ -370,7 +370,7 @@ def _collect_chat_proxy_stream(
 
     account = {"id": 1, "name": "test-account"}
 
-    async def pick_account(_excluded):
+    async def pick_account(_excluded, **kwargs):
         return account
 
     async def valid_headers(_account):
@@ -462,7 +462,7 @@ def _install_chat_account_stream_fakes(
             account_id = int(headers["X-Test-Account"])
             return FakeResponse(streams[account_id])
 
-    async def pick_account(excluded):
+    async def pick_account(excluded, **kwargs):
         calls["picks"].append(set(excluded))
         return next((account for account in accounts if account["id"] not in excluded), None)
 
@@ -553,7 +553,7 @@ def test_proxy_chat_injects_system_and_uses_intl_backend(monkeypatch, isolated_d
     seen = {}
     account = {"id": 1, "name": "intl", "domain": "www.workbuddy.ai"}
 
-    async def pick(_excluded):
+    async def pick(_excluded, **kwargs):
         return account
 
     async def fake_headers(_account):
@@ -658,6 +658,15 @@ def test_api_keys_are_encrypted_and_recoverable_for_admin(isolated_db):
     assert "key" not in db.list_api_keys()[0]
     assert db.list_api_keys(include_secret=True)[0]["key"] == raw_key
     assert "key" not in db.get_api_key_by_key(raw_key)
+
+
+def test_legacy_codex_key_type_can_clear_without_changing_secret(isolated_db):
+    raw_key = "sk-cb-legacy-codex-type"
+    kid = db.add_api_key(raw_key, "old-codex", client_type="codex")
+    db.update_api_key(kid, {"client_type": "custom"})
+    stored = db.list_api_keys(include_secret=True)[0]
+    assert stored["client_type"] == "custom"
+    assert stored["key"] == raw_key
 
 
 def test_hash_only_legacy_api_key_is_reported_as_unrecoverable(isolated_db):
@@ -1187,7 +1196,7 @@ def test_responses_json_schema_constraint_survives_codex_instruction_replacement
         for message in chat_payload["messages"]
         if message["role"] == "system"
     ]
-    assert responses._CODEX_SAFE_SYSTEM_PROMPT in system_messages
+    assert long_instructions in system_messages
     assert any("risk_level" in content and "outcome" in content for content in system_messages)
     assert "response_format" in chat_payload
 
@@ -3294,7 +3303,7 @@ def test_non_stream_proxy_fails_over_on_retryable_upstream(isolated_db, monkeypa
     account = db.get_account(account_id)
     calls = []
 
-    async def pick(exclude):
+    async def pick(exclude, **kwargs):
         calls.append("pick")
         return account
 
@@ -3345,82 +3354,18 @@ def test_valid_headers_is_async_and_uses_decrypted_token(isolated_db):
     assert headers["Authorization"] == "Bearer access-secret"
 
 
-def test_codex_sanitize_skips_non_codex_prompts():
-    """DSH 等非 Codex prompt 不应被清洗或整体替换。"""
-    dsh_prompt = "You are DSH, an autonomous agent. Use tools: sandbox access, execute shell commands, filesystem. " + ("x" * 2000)
-    payload = {
-        "model": "auto",
-        "messages": [
-            {"role": "system", "content": dsh_prompt},
-            {"role": "user", "content": "run the workflow"},
-        ],
-        "tools": [{"type": "function", "function": {"name": "bash", "description": "execute shell commands"}}],
-    }
-    out = responses.apply_codex_sanitize(dict(payload))
-    assert out["messages"][0]["content"] == dsh_prompt
-    # 工具原样保留（codex 路径会过滤非 function 工具，但这里不触发清洗）
-    assert out["tools"][0]["function"]["description"] == "execute shell commands"
-
-
-def test_codex_sanitize_still_sanitizes_codex_prompts():
-    """带 Codex 特征的 prompt 仍走清洗。"""
-    codex_prompt = (
-        "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written.\n"
-        "sandbox_mode=workspace\n</permissions instructions>\n"
-        "# Escalation Requests\nYou may request escalation.\n"
-        "security policy: do not delete files. " + ("y" * 2000)
-    )
-    payload = {
-        "model": "auto",
-        "messages": [{"role": "system", "content": codex_prompt}, {"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "bash", "description": "execute shell commands and sandbox"}}],
-    }
-    out = responses.apply_codex_sanitize(dict(payload))
-    cleaned = out["messages"][0]["content"]
-    assert cleaned != codex_prompt
-    assert "Filesystem sandboxing" not in cleaned
-    assert "security policy" not in cleaned
-    # Codex 特征段落被移除/清洗（本例所有特征段被删除后为空串，同样证明清洗生效）
-    assert cleaned == "" or "coding assistant" in cleaned
-
-
-def test_current_codex_prompt_is_replaced_when_legacy_markers_are_absent():
-    """New Codex CLI prompts must still enter the sanitizer."""
+def test_responses_keeps_long_codex_instructions():
     prompt = (
         "You are Codex, a coding agent.\n"
         "Use the workspace and follow approval rules for shell commands.\n"
         + ("Keep helping with the coding task. " * 80)
     )
-    payload = {
+    chat_payload = responses.responses_to_chat({
         "model": "deepseek-v4-flash",
         "instructions": prompt,
         "input": "hello",
-    }
-
-    chat_payload = responses.responses_to_chat(payload)
-
-    assert responses._looks_like_codex_prompt(prompt)
-    assert chat_payload["messages"][0]["content"] == responses._CODEX_SAFE_SYSTEM_PROMPT
-    assert "approval" not in chat_payload["messages"][0]["content"]
-
-
-def test_mentions_of_codex_or_coding_agent_alone_are_not_sanitized():
-    prompt = "This note mentions Codex but is not the Codex client prompt. " + ("x" * 1500)
-    quoted = "The docs say you are Codex when using the shell. " + ("x" * 1500)
-    payload = {"instructions": prompt, "input": "hello"}
-
-    chat_payload = responses.responses_to_chat(payload)
-    quoted_payload = responses.responses_to_chat({"instructions": quoted, "input": "hello"})
-
+    })
     assert chat_payload["messages"][0]["content"] == prompt
-    assert quoted_payload["messages"][0]["content"] == quoted
-
-
-def test_codex_sanitize_passthrough_without_system_prompt():
-    """无 system message 时原样返回。"""
-    payload = {"model": "auto", "messages": [{"role": "user", "content": "hello"}]}
-    out = responses.apply_codex_sanitize(dict(payload))
-    assert out == payload
 
 
 # ============================================================
@@ -3442,11 +3387,6 @@ def _tool_loop_body():
     }
 
 
-def test_stall_detection_ack_text():
-    body = _tool_loop_body()
-    assert proxy._request_has_tool_loop(body)
-    assert proxy._looks_like_stall_text("好的，马上继续跑流程。")
-    assert proxy._is_tool_stall(body, "stop", False, "好的，马上继续跑流程。")
 
 
 @pytest.mark.parametrize("terminal,done,valid", [(None, False, False), (None, True, False), ("stop", False, True), ("stop", True, True), ("length", False, True)])
@@ -3482,260 +3422,197 @@ def test_nonstream_collection_validates_completion(monkeypatch, isolated_db, ter
         assert "finish reason" in result[1][1]["error"]["message"]
 
 
-def test_stall_detection_short_english_ack():
-    body = _tool_loop_body()
-    assert proxy._looks_like_stall_text("OK.")
-    assert proxy._looks_like_stall_text("Got it, continuing.")
-    assert proxy._is_tool_stall(body, "stop", False, "Let me write it.")
-    assert not proxy._looks_like_stall_text("In summary, the three files are done.")
-
-
-def test_stall_detection_rejects_summary():
-    body = _tool_loop_body()
-    assert not proxy._looks_like_stall_text("任务完成，总结如下：共处理 3 个文件。")
-    assert not proxy._is_tool_stall(body, "stop", False, "任务完成，总结如下：共处理 3 个文件。")
-
-
-def test_stall_detection_requires_tool_loop_and_tools():
-    no_tool_history = {
+def _tool_loop_body(older_history=False):
+    messages = [
+        {"role": "user", "content": "列出文件"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
+    ]
+    if older_history:
+        messages.extend([
+            {"role": "user", "content": "先说明一下文件名。"},
+            {"role": "assistant", "content": "文件是 a.txt。"},
+            {"role": "user", "content": "现在给出最终结果。"},
+        ])
+    else:
+        messages.append({"role": "user", "content": "继续跑流程。"})
+    return {
         "model": "auto",
-        "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
-        "messages": [{"role": "user", "content": "继续。"}],
+        "stream": False,
+        "tools": [{"type": "function", "function": {"name": "list_files", "parameters": {"type": "object"}}}],
+        "messages": messages,
     }
-    assert not proxy._request_has_tool_loop(no_tool_history)
-    assert not proxy._is_tool_stall(no_tool_history, "stop", False, "好的，马上继续。")
-    no_tools = {
-        "model": "auto",
-        "messages": [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": None, "tool_calls": []},
-            {"role": "tool", "tool_call_id": "x", "content": "y"},
-            {"role": "user", "content": "继续。"},
-        ],
-    }
-    assert not proxy._is_tool_stall(no_tools, "stop", False, "好的，马上继续。")
-    assert not proxy._is_tool_stall(_tool_loop_body(), "stop", True, "好的，马上继续。")
-    assert not proxy._is_tool_stall(_tool_loop_body(), "length", False, "好的，马上继续。")
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "stream"])
+@pytest.mark.parametrize("older_history", [False, True], ids=["recent-tool-result", "older-tool-result"])
+@pytest.mark.parametrize(
+    "kind,text",
+    [
+        ("text", "The files are ready."),
+        ("text", '{"ok":true,"count":2}'),
+        ("text", "Would you like me to continue?"),
+        ("text", "I can't help with that request."),
+        ("text", "I'll update the file now."),
+        ("text", 'The example quote says “I will continue” in the transcript.'),
+        ("tool_call", ""),
+    ],
+    ids=["final-answer", "short-json", "confirmation", "refusal", "action-promise", "quoted-promise", "current-tool-call"],
+)
+def test_tool_loop_stop_does_not_reprompt_or_double_account(
+    monkeypatch, isolated_db, stream, older_history, kind, text
+):
+    """Exercise the real SSE collector/streamer with legacy stall flags enabled."""
+    monkeypatch.setenv("CB_GATEWAY_TOOL_STALL_RETRY", "1")
+    monkeypatch.setenv("CB_GATEWAY_TOOL_STALL_FAIL_STREAM", "1")
 
+    account_id = db.add_account({
+        "name": "synthetic-upstream",
+        "access_token": "synthetic-access-token",
+        "refresh_token": "synthetic-refresh-token",
+    })
+    key_id = db.add_api_key("sk-synthetic-tool-loop", "synthetic-key")
+    account = {"id": account_id, "name": "synthetic-upstream", "provider": "workbuddy"}
+    api_key_info = {"id": key_id, "name": "synthetic-key", "_bind_channel": "workbuddy"}
+    requests = []
 
-def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
-    """停转时自动以 tool_choice=required 重试，并优先采用重试出的工具调用结果。"""
-    stall_json = {
-        "id": "c1", "object": "chat.completion", "created": 1,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "好的，马上继续跑流程。"},
-                     "finish_reason": "stop"}],
-        "usage": {},
-    }
-    fixed_json = {
-        "id": "c2", "object": "chat.completion", "created": 2,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "t1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
-                     "finish_reason": "tool_calls"}],
-        "usage": {},
-    }
+    if kind == "tool_call":
+        first_delta = {
+            "tool_calls": [{
+                "index": 0,
+                "id": "call-current",
+                "type": "function",
+                "function": {"name": "list_files", "arguments": "{}"},
+            }],
+        }
+        finish_reason = "tool_calls"
+    else:
+        first_delta = {"content": text}
+        finish_reason = "stop"
 
-    calls = []
-
-    account = {"id": 1, "name": "test-account"}
-
-    async def pick_account(_excluded):
-        return account
-
-    async def valid_headers(_account):
-        return {"Authorization": "Bearer test"}
-
-    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
-        calls.append(body.get("tool_choice"))
-        if len(calls) == 1:
-            return ("json", stall_json)
-        return ("json", fixed_json)
-
-    monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
-    monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
-    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
-    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
-    monkeypatch.setattr(auth_manager, "backend_url", lambda account=None: "https://upstream.test")
-    monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
-
-    async def run():
-        return await proxy.proxy_chat_completions(_tool_loop_body(), None)
-
-    result = asyncio.run(run())
-    assert result[0] == "json"
-    assert result[1]["choices"][0]["message"].get("tool_calls")
-    assert calls == [None, "required"]
-
-
-def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkeypatch, isolated_db):
-    """重试仍无工具调用时，保留首次的文字回复（例如总结类回答）。"""
-    stall_json = {
-        "id": "c1", "object": "chat.completion", "created": 1,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "好的，马上继续。"},
-                     "finish_reason": "stop"}],
-        "usage": {},
-    }
-    again_json = {
-        "id": "c2", "object": "chat.completion", "created": 2,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "好的，马上继续。"},
-                     "finish_reason": "stop"}],
-        "usage": {},
-    }
-
-    calls = []
-
-    account = {"id": 1, "name": "test-account"}
-
-    async def pick_account(_excluded):
-        return account
-
-    async def valid_headers(_account):
-        return {"Authorization": "Bearer test"}
-
-    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
-        calls.append(body.get("tool_choice"))
-        if len(calls) == 1:
-            return ("json", stall_json)
-        return ("json", again_json)
-
-    monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
-    monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
-    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
-    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
-    monkeypatch.setattr(auth_manager, "backend_url", lambda account=None: "https://upstream.test")
-    monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
-
-    async def run():
-        return await proxy.proxy_chat_completions(_tool_loop_body(), None)
-
-    result = asyncio.run(run())
-    assert result[0] == "json"
-    assert result[1]["choices"][0]["message"].get("content") == "好的，马上继续。"
-    assert calls == [None, "required"]
-
-
-def test_stream_tool_loop_retries_stall_like_nonstream(monkeypatch, isolated_db):
-    stall_json = {
-        "id": "c1", "object": "chat.completion", "created": 1,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Let me continue."},
-                     "finish_reason": "stop"}],
-        "usage": {},
-    }
-    fixed_json = {
-        "id": "c2", "object": "chat.completion", "created": 2,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "t1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
-                     "finish_reason": "tool_calls"}],
-        "usage": {},
-    }
-    calls = []
-    account = {"id": 1, "name": "test-account"}
-
-    async def pick_account(_excluded):
-        return account
-
-    async def valid_headers(_account):
-        return {"Authorization": "Bearer test"}
-
-    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
-        calls.append(body.get("tool_choice"))
-        if len(calls) == 1:
-            return ("json", stall_json)
-        return ("json", fixed_json)
-
-    monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
-    monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
-    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
-    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
-    monkeypatch.setattr(auth_manager, "backend_url", lambda account=None: "https://upstream.test")
-    monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
-
-    body = _tool_loop_body()
-    body["stream"] = True
-
-    async def run():
-        result = await proxy.proxy_chat_completions(body, None)
-        assert result[0] == "stream"
-        return b"".join([chunk async for chunk in result[1]])
-
-    raw = asyncio.run(run())
-    payloads, done_count = _parse_chat_proxy_sse(raw)
-    assert done_count == 1
-    assert calls == [None, "required"]
-    assert any(
-        (p.get("choices") or [{}])[0].get("delta", {}).get("tool_calls")
-        for p in payloads
-    )
-    assert any(
-        (p.get("choices") or [{}])[0].get("finish_reason") == "tool_calls"
-        for p in payloads
-    )
-
-
-def _stall_stream_chunks() -> list[bytes]:
-    """上游流：纯文本增量 + finish_reason=stop（无任何工具调用）。"""
-    return [
+    response_chunks = [
         _chat_sse({
-            "id": "c1", "object": "chat.completion.chunk", "created": 1,
-            "choices": [{"index": 0, "delta": {"content": "好的，马上继续跑流程。"}, "finish_reason": None}],
+            "id": "chatcmpl-synthetic",
+            "object": "chat.completion.chunk",
+            "created": 100,
+            "model": "auto",
+            "choices": [{"index": 0, "delta": first_delta, "finish_reason": None}],
         }),
         _chat_sse({
-            "id": "c1", "object": "chat.completion.chunk", "created": 1,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "id": "chatcmpl-synthetic",
+            "object": "chat.completion.chunk",
+            "created": 100,
+            "model": "auto",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8, "credit": 0.25},
         }),
         b"data: [DONE]\n\n",
     ]
 
+    class FakeResponse:
+        status_code = 200
 
-def test_stream_tool_stall_fails_when_flag_on(monkeypatch, isolated_db):
-    """流式停转 + CB_GATEWAY_TOOL_STALL_FAIL_STREAM=1 → 回合标记为失败。"""
-    monkeypatch.setattr(proxy, "TOOL_STALL_FAIL_STREAM", True)
-    body = _tool_loop_body()
-    body["stream"] = True
-    raw = _collect_chat_proxy_stream(_stall_stream_chunks(), monkeypatch, body)
-    payloads, done_count = _parse_chat_proxy_sse(raw)
-    assert done_count == 1
-    errors = [p for p in payloads if p.get("error")]
-    assert len(errors) == 1
-    assert errors[0]["error"]["code"] == "upstream_tool_stall"
+        async def __aenter__(self):
+            return self
 
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
 
-def test_stream_tool_stall_passthrough_when_flag_off(monkeypatch, isolated_db):
-    """默认（flag off）流式停转原样透传，仅日志标记 tool_stall。"""
-    body = _tool_loop_body()
-    body["stream"] = True
-    raw = _collect_chat_proxy_stream(_stall_stream_chunks(), monkeypatch, body)
-    payloads, done_count = _parse_chat_proxy_sse(raw)
-    assert done_count == 1
-    assert not any(p.get("error") for p in payloads)
-    assert any(p.get("choices") and p["choices"][0].get("finish_reason") == "stop" for p in payloads)
+        async def aiter_lines(self):
+            for chunk in response_chunks:
+                for line in chunk.decode("utf-8").splitlines():
+                    yield line
 
+        async def aiter_bytes(self):
+            for chunk in response_chunks:
+                yield chunk
 
-def test_stream_tool_stall_is_logged(monkeypatch, isolated_db):
-    """流式停转（flag off）时日志 finish_reason 记为 tool_stall。"""
-    calls = _install_chat_account_stream_fakes(
-        monkeypatch,
-        [{"id": 1, "name": "test-account"}],
-        {1: _stall_stream_chunks()},
-    )
-    body = _tool_loop_body()
-    body["stream"] = True
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
 
-    async def collect():
-        return b"".join([
-            chunk
-            async for chunk in proxy._stream_upstream(body, None, "test-model")
-        ])
+        async def __aenter__(self):
+            return self
 
-    raw = asyncio.run(collect())
-    assert b"tool stall" not in raw
-    logged_finishes = [entry[0][8] for entry in calls["logs"]]
-    assert "tool_stall" in logged_finishes
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def stream(self, method, url, *, headers, json, **kwargs):
+            requests.append({"method": method, "url": url, "body": json})
+            return FakeResponse()
+
+    async def pick_account(_excluded, **kwargs):
+        return account
+
+    async def valid_headers(_account):
+        return {"Authorization": "Bearer synthetic-only"}
+
+    monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
+    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
+    monkeypatch.setattr(auth_manager, "backend_url", lambda _account=None: "https://upstream.mock")
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+
+    payload = _tool_loop_body(older_history=older_history)
+    payload["stream"] = stream
+
+    async def send():
+        result = await proxy.proxy_chat_completions(payload, api_key_info)
+        if stream:
+            assert result[0] == "stream"
+            return b"".join([chunk async for chunk in result[1]])
+        assert result[0] == "json"
+        return result[1]
+
+    response = asyncio.run(send())
+    expected_requests = 1
+    assert len(requests) == expected_requests
+    assert all(request["method"] == "POST" for request in requests)
+    assert all(request["body"].get("tool_choice") is None for request in requests)
+
+    with sqlite3.connect(isolated_db) as conn:
+        log_count, logged_tokens, logged_credit = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(credit), 0) FROM logs"
+        ).fetchone()
+        log_terminals = conn.execute(
+            "SELECT finish_reason, status_code, error_msg FROM logs"
+        ).fetchall()
+    account_after = db.get_account(account_id)
+    key_after = db.get_api_key_by_key("sk-synthetic-tool-loop")
+    assert log_count == expected_requests
+    assert logged_tokens == 8 * expected_requests
+    assert logged_credit == pytest.approx(0.25 * expected_requests)
+    assert account_after["total_requests"] == expected_requests
+    assert account_after["total_tokens"] == 8 * expected_requests
+    assert account_after["total_credits"] == pytest.approx(0.25 * expected_requests)
+    assert key_after["total_requests"] == expected_requests
+    assert key_after["total_tokens"] == 8 * expected_requests
+    assert len(log_terminals) == expected_requests
+    assert all(status == 200 and error == "" for _finish, status, error in log_terminals)
+
+    if stream:
+        payloads, done_count = _parse_chat_proxy_sse(response)
+        assert done_count == 1
+        if kind == "tool_call":
+            assert [finish for finish, _status, _error in log_terminals] == ["tool_calls"]
+            assert any(
+                (item.get("choices") or [{}])[0].get("delta", {}).get("tool_calls")
+                for item in payloads
+            )
+        else:
+            assert [finish for finish, _status, _error in log_terminals] == ["stop"]
+            assert not any(item.get("error") for item in payloads)
+            assert "".join(
+                (item.get("choices") or [{}])[0].get("delta", {}).get("content", "")
+                for item in payloads
+            ) == text
+            assert any(
+                (item.get("choices") or [{}])[0].get("finish_reason") == "stop"
+                for item in payloads
+            )
+    elif kind == "tool_call":
+        assert [finish for finish, _status, _error in log_terminals] == ["tool_calls"]
+        assert response["choices"][0]["finish_reason"] == "tool_calls"
+        assert response["choices"][0]["message"]["tool_calls"][0]["id"] == "call-current"
+    else:
+        assert [finish for finish, _status, _error in log_terminals] == ["stop"]
+        assert response["choices"][0]["finish_reason"] == "stop"
+        assert response["choices"][0]["message"]["content"] == text

@@ -10,14 +10,16 @@ from providers.protocol import ChannelId
 
 
 class WorkBuddyProvider:
-    id: ChannelId = "workbuddy"
-    display_name = "WorkBuddy / CodeBuddy"
-    checkin_supported = True
+    def __init__(self, channel: str = "workbuddy", display_name: str = "WorkBuddy / CodeBuddy", realm: str = "cn"):
+        self.id: ChannelId = channel
+        self.display_name = display_name
+        self.realm = realm
+        self.checkin_supported = True
 
     def list_models(self) -> list[dict]:
         import catalog
 
-        return catalog.models_for(self.id, catalog.workbuddy_fallback_models())
+        return catalog.models_for(self.id, catalog.workbuddy_fallback_models(self.id))
 
     def alias_map(self) -> dict[str, str]:
         import aliases
@@ -36,18 +38,16 @@ class WorkBuddyProvider:
     def pick_account(self, exclude_ids: set[int] | None = None) -> Optional[dict]:
         return auth_manager.pick_account(exclude_ids, provider=self.id)
 
-    async def pick_account_with_fallback(
-        self, exclude_ids: set[int] | None = None
-    ) -> Optional[dict]:
+    async def pick_account_with_fallback(self, exclude_ids: set[int] | None = None) -> Optional[dict]:
         return await auth_manager.pick_account_with_fallback(exclude_ids, provider=self.id)
 
     async def has_usable_account(self) -> bool:
         return await self.pick_account_with_fallback() is not None
 
-    async def start_login(self, realm: str = "cn") -> dict:
+    async def start_login(self, realm: str = "") -> dict:
         from providers.workbuddy import oauth
 
-        return await oauth.start_login(realm)
+        return await oauth.start_login(realm or self.realm)
 
     async def poll_login(self, state: str) -> dict:
         from providers.workbuddy import oauth
@@ -60,7 +60,10 @@ class WorkBuddyProvider:
         if isinstance(api_key_info, dict) and "_log_model" in api_key_info:
             log_model = api_key_info.get("_log_model")
             info = {k: v for k, v in api_key_info.items() if k != "_log_model"} or None
-        return await proxy.proxy_chat_completions(payload, info, log_model=log_model)
+        return await proxy.proxy_chat_completions(
+            payload, info, log_model=log_model, provider=self.id
+        )
 
 
 PROVIDER = WorkBuddyProvider()
+INTL = WorkBuddyProvider("workbuddy-i", "WorkBuddy 国际版", "global")

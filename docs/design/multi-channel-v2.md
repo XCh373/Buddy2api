@@ -51,7 +51,7 @@ Buddy2api 今天是单一厂商网关：`server.py` 把 `/v1/chat/completions` �
 | HTTP 壳 | `server.py` | FastAPI：`/v1/*`、`/admin/*`、`web/index.html`。启动时 `auth_manager.auto_scan_and_import()` **静默入库** |
 | 账号 / Token / 签到 | `auth_manager.py` | 扫描 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info`；刷新 `/v2/plugin/auth/token/refresh`；签到 `/v2/billing/meter/*`；`pick_account()` 全局粘性；`pick_account_with_fallback` 遍历 **全部** `expired` 行 |
 | 指纹 | `fingerprint.py` | CLI/2.109.2、`X-IDE-*`、`x-stainless-*`、B3、`X-No-*`、按 domain 的 Origin。**Chat 请求禁止带 `X-Refresh-Token`** |
-| 代理 | `proxy.py` | `BACKEND = "https://copilot.tencent.com"`；`httpx.AsyncClient`（未开 `http2=True`）；SSE 规范化、内容审核短拒答、tool stall 重试；流式 **第一个 SSE 字节之后不再换号**（`output_started`）；`DEFAULT_MODELS` 含未加前缀的 `glm-5.2` / `auto`；`resolve_model_alias` 未命中则 **原样返回** |
+| 代理 | `proxy.py` | `BACKEND = "https://copilot.tencent.com"`；`httpx.AsyncClient`（未开 `http2=True`）；SSE 规范化、内容审核短拒答；合法 `stop` 按完成响应返回，不从文本推断工具重试；流式 **第一个 SSE 字节之后不再换号**（`output_started`）；`DEFAULT_MODELS` 含未加前缀的 `glm-5.2` / `auto`；`resolve_model_alias` 未命中则 **原样返回** |
 | Responses 桥 | `responses.py` | `/v1/responses` → `proxy.proxy_chat_completions()` |
 | 存储 | `database.py` | `accounts` **无 `provider` 列**；`add_account` 显式列清单；uid 去重只在应用层；`get_active_accounts()` 跨全部行 |
 | 凭据加密 | `credential_crypto.py` | Windows 无 `CB_GATEWAY_MASTER_KEY` 时写 `enc:v1:dpapi:`，Linux **拒绝**解密 |
@@ -217,7 +217,7 @@ OpenCode 实际线上的 HTTP `model` 是 **models 对象的 key**，不是 `-m 
 
 - **决定：** Router：KD-4 得到 `(channel, inner, original)` → 启用检查 → **允许**调用 `provider.has_usable_account()`（可用 `pick_account_with_fallback` 实现 dry-pick）→ 空则 **预留前** 503 → 再 `_reserve_client_quota` → `await provider.chat_completions(dispatch_payload, api_key_info)`，返回现有 `("stream"|"json"|"error", ...)` 元组。
 - Router **不构造 `httpx.AsyncClient`、不发起 chat**（不 POST `/v2/chat/completions`、不打 QwenWork SSE）。Router **可以** dry-pick / `has_usable_account`；该路径 **可以** `refresh()` token（WorkBuddy `/v2/plugin/auth/token/refresh` 也是上游，但不是 chat）。禁止把 dry-pick 写成「零网络」而丢掉 1.4.10 的 expired 刷新回退。
-- `build_chat` / `new_client` / `parse_sse` 是 provider **内部**。`chat_completions` 是 **唯一** chat HTTP 入口。通道内 3 次 failover、stall、audit、8 MiB SSE 留在 WorkBuddy `proxy.py`，**不提升到 Router**。
+- `build_chat` / `new_client` / `parse_sse` 是 provider **内部**。`chat_completions` 是 **唯一** chat HTTP 入口。通道内 3 次 failover、audit、8 MiB SSE 留在 WorkBuddy `proxy.py`，**不提升到 Router**。
 - 流式：**第一个已向客户端发出的 SSE 字节之后禁止换账号**。
 - Transport：WorkBuddy 继续当前 httpx；QwenWork 独立 client；QoderWork 若实现则强制 HTTP/1.1。
 - **拒绝：** 全局共享 client；spawn 官方 CLI 子进程。
@@ -442,7 +442,7 @@ def list_accounts(*, provider: str | None = None) -> list[dict]:
 `expires_at` **一律存整数毫秒**（与今天 WorkBuddy `is_token_expired` 的 `time.time()*1000 - 60_000` 一致）。QwenWork 若返回 ISO `expires_at`，在 `refresh()` 写库前换成 ms。每个 provider 必须实现 `is_token_expired`，禁止 WorkBuddy 函数去比较 QwenWork 行。
 
 共享、通道无关：OpenAI SSE observer（8 MiB）。QwenWork 先剥外层再交给它。  
-**不共享：** 头、UA、TLS、HTTP 版本、签到 URL、模型别名、retry/stall/audit 策略。
+**不共享：** 头、UA、TLS、HTTP 版本、签到 URL、模型别名、retry/audit 策略。
 
 ### Router：bind + 配额门闩，不发起 chat
 
@@ -595,7 +595,7 @@ Cherry / curl / Codex：存量 Key 升级后仍绑 `workbuddy`，`model: auto` �
 | 额度 / 签到 | `get-user-resource` / `checkin-activity-status` / `daily-checkin` |
 | 指纹 | CLI/2.109.2，见 `fingerprint.py` |
 | 路由 | 最高 priority 上 sticky；同级 `_route_sort_key`；failover ≤3；**出字后不换号** |
-| 通道内策略 | tool stall、审核短拒答、`developer`→`system` — **不提升到 Router** |
+| 通道内策略 | 审核短拒答、`developer`→`system` — **不提升到 Router** |
 | `chat_completions` | 即现 `proxy.proxy_chat_completions` |
 
 PR0 新增头白名单测试（**新测试**，不复用 `test_valid_headers_is_async_and_uses_decrypted_token`）：chat 头含 `X-IDE-Type`，不含 `Cosy-Key`，不含 `X-Refresh-Token`；`refresh_headers` 才含后者。

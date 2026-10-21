@@ -1,4 +1,4 @@
-"""Decrypt TraeWork storage.json iCubeAuthInfo blobs.
+"""Encrypt and decrypt TraeWork storage.json iCubeAuthInfo blobs.
 
 Algorithm matches official TRAE SOLO CN 0.1.56 `byteCrypto.js`:
 magic `tc\\x05\\x10\\x00\\x00`, AES-128-CBC, SHA-512 checksum.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
@@ -37,6 +38,26 @@ _DRE = bytes(
     ]
 )
 _SALT = bytes(a ^ b for a, b in zip(_URE, _DRE))
+
+
+def encrypt_tc_b64(value: str, key_mat: bytes | None = None) -> str:
+    """Return a blob the official 0.1.56 client can decrypt."""
+    if not isinstance(value, str):
+        raise CredentialCryptoError("TraeWork auth plaintext is not text")
+    body = value.encode("utf-8")
+    if key_mat is None:
+        key_mat = os.urandom(_KEY_LEN)
+    if len(key_mat) != _KEY_LEN:
+        raise CredentialCryptoError("TraeWork auth key material must be 32 bytes")
+    plain = hashlib.sha512(body).digest() + body
+    padder = PKCS7(128).padder()
+    padded = padder.update(plain) + padder.finalize()
+    mixed = hashlib.sha512(key_mat).digest() + _SALT
+    derived = hashlib.sha512(mixed).digest()
+    aes_key, iv = derived[:16], derived[16:32]
+    encryptor = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).encryptor()
+    cipher = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(_MAGIC + key_mat + cipher).decode("ascii")
 
 
 def decrypt_tc_b64(value: str) -> str:

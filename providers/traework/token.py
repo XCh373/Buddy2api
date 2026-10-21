@@ -15,7 +15,7 @@ from providers.traework.constants import (
     PLATFORM_CODE,
     UG_API,
 )
-from providers.traework.store import iso_to_ms
+from providers.traework.store import iso_to_ms, write_refreshed_session
 
 
 class TraeWorkAuthError(RuntimeError):
@@ -103,6 +103,38 @@ def _parse_exchange(result: dict) -> dict:
     }
 
 
+def _exchange_error(response) -> TraeWorkAuthError:
+    payload = {}
+    try:
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            payload = parsed
+    except ValueError:
+        payload = {}
+    meta = payload.get("ResponseMetadata") if isinstance(payload.get("ResponseMetadata"), dict) else {}
+    err = meta.get("Error") if isinstance(meta.get("Error"), dict) else {}
+    code = str(err.get("Code") or payload.get("code") or "")
+    detail = str(err.get("Message") or payload.get("message") or "")
+    dead = response.status_code in {401, 403} or code in {
+        "20101",
+        "20324",
+        "20125",
+        "20126",
+        "20315",
+        "20401",
+        "20403",
+    }
+    if dead:
+        text = "ExchangeToken failed: HTTP {status} 续期令牌已失效。请打开 TraeWork 重新登录后再导入".format(
+            status=response.status_code or 401
+        )
+        return TraeWorkAuthError(text)
+    text = f"ExchangeToken failed: HTTP {response.status_code}"
+    if detail and detail != "None":
+        text += f" {detail}"
+    return TraeWorkAuthError(text[:240])
+
+
 async def refresh_account(account: dict) -> dict:
     import database as db
 
@@ -127,7 +159,7 @@ async def refresh_account(account: dict) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(url, headers=oauth_headers(access), json=body)
     if response.status_code >= 400:
-        raise TraeWorkAuthError(f"ExchangeToken failed: HTTP {response.status_code}")
+        raise _exchange_error(response)
     try:
         data = response.json()
     except ValueError as exc:
@@ -140,5 +172,9 @@ async def refresh_account(account: dict) -> dict:
     if not patch.get("refresh_token"):
         patch["refresh_token"] = refresh
     db.update_account(int(account["id"]), patch)
+    try:
+        write_refreshed_session(account, patch)
+    except Exception:
+        pass
     fresh = db.get_account(account["id"])
     return fresh or {**account, **patch}

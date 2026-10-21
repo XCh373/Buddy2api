@@ -1,4 +1,6 @@
+import asyncio
 import hashlib
+import time
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,14 @@ import providers
 import router
 from providers.protocol import UnknownChannel, UnknownModel
 from providers.qwenwork import cosy
-from providers.qwenwork.chat import build_body, envelope_error, static_headers, translate_model, unwrap_sse_payload
+from providers.qwenwork.chat import (
+    build_body,
+    envelope_error,
+    static_headers,
+    translate_model,
+    unwrap_sse_payload,
+    usage_from_payload,
+)
 from providers.qwenwork.encode import prepare_infer
 from providers.qwenwork.constants import COSY_VERSION, COSY_VERSION_FROZEN, RSA_PUBLIC_KEY_PEM, STATIC_MODELS
 from providers.qwenwork.store import parse_credentials, qwenwork_auth_dirs
@@ -35,7 +44,16 @@ def qwen_enabled(monkeypatch):
 
 def test_qwenwork_in_default_registry(monkeypatch):
     monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
-    assert providers.enabled_provider_ids() == ["workbuddy", "qclaw", "qwenwork", "traework"]
+    assert providers.enabled_provider_ids() == [
+        "workbuddy",
+        "workbuddy-i",
+        "qwenwork",
+        "qoder",
+        "qoder-i",
+        "traework",
+        "loomy",
+        "xiaohuanxiong",
+    ]
     assert providers.get_provider("qwenwork") is not None
     assert "qwenwork" in providers._LOADED
 
@@ -167,6 +185,16 @@ def test_unwrap_outer_sse_envelope():
     assert unwrap_sse_payload(inner) == [inner]
 
 
+def test_usage_is_read_from_stream_payload():
+    usage, finish = usage_from_payload(
+        '{"choices":[{"finish_reason":"tool_calls","delta":{}}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}'
+    )
+    assert usage["prompt_tokens"] == 12
+    assert usage["completion_tokens"] == 3
+    assert finish == "tool_calls"
+    assert usage_from_payload("not-json") == ({}, "")
+
+
 def test_static_models_include_live_and_legacy_ids():
     assert "pro" in STATIC_MODELS
     assert "flash" in STATIC_MODELS
@@ -281,3 +309,343 @@ def test_prepare_infer_emits_encode_body():
     assert prepared.headers.get("Cosy-Version") == "1.1.32"
     assert "Authorization" in prepared.headers
     assert "Cosy-Key" in prepared.headers
+
+
+def test_daily_credit_notice_unwraps_adapter_payload():
+    from providers.qwenwork.checkin import parse_daily_credit_notice
+
+    assert parse_daily_credit_notice({"data": {"should_show": True, "credits": 100}}) == {
+        "should_show": True,
+        "credits": 100.0,
+    }
+    assert parse_daily_credit_notice({"data": {"data": {"should_show": False, "credits": 0}}})["should_show"] is False
+    assert parse_daily_credit_notice({"data": {"should_show": True, "credits": 1.5}})["credits"] == 0
+
+
+def test_claim_reads_same_day_wallet_and_status_keeps_it(isolated_db, monkeypatch):
+    from providers.qwenwork import checkin
+
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-1",
+            "provider": "qwenwork",
+            "access_token": "device-token",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    account = db.get_account(account_id)
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": {
+                    "active_wallets": {
+                        "wallets": [
+                            {"balance": 99.5, "valid_to": checkin._next_shanghai_midnight().isoformat()},
+                            {"balance": 2000, "valid_to": "2026-11-18T22:09:24+08:00"},
+                        ]
+                    }
+                }
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            raise AssertionError(f"claim must not POST {url}")
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs["headers"]))
+            return FakeResponse()
+
+    monkeypatch.setattr(checkin.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(checkin.claim_checkin(account))
+    assert result["ok"] is True
+    assert result["claimed"] is False
+    assert result["already_claimed"] is True
+    assert result["credit"] == 99.5
+    assert result["message"] == "今日每日积分已到账 99.5"
+    assert calls[0][0].endswith("/api/v1/adapter/user/wallets")
+    assert "daily-credit-notice" not in calls[0][0]
+    assert calls[0][1]["Authorization"] == "Bearer device-token"
+    assert calls[0][1]["X-QwenWork-App-Mode"] == "standard"
+    assert calls[0][1]["X-QwenWork-Version"] == "1.3.1"
+
+    status = asyncio.run(checkin.fetch_checkin(account))
+    assert status["already_claimed"] is True
+    assert status["claimed"] is False
+    assert status["credit"] == 99.5
+    assert len(calls) == 1
+
+
+def test_claim_refreshes_once_after_unauthorized(isolated_db, monkeypatch):
+    from providers.qwenwork import checkin
+
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-2",
+            "provider": "qwenwork",
+            "access_token": "old",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    account = db.get_account(account_id)
+    posts = {"n": 0}
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def json(self):
+            if self.status_code >= 400:
+                return {}
+            return {"data": {"should_show": False, "credits": 0}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            posts["n"] += 1
+            assert "daily-credit-notice" not in url
+            if posts["n"] == 1:
+                assert kwargs["headers"]["Authorization"] == "Bearer old"
+                return FakeResponse(401)
+            assert kwargs["headers"]["Authorization"] == "Bearer fresh"
+            return FakeResponse(200)
+
+    async def fake_refresh(row):
+        return {**row, "access_token": "fresh"}
+
+    monkeypatch.setattr(checkin.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(checkin, "refresh_account", fake_refresh)
+    result = asyncio.run(checkin.claim_checkin(account))
+    assert posts["n"] == 2
+    assert result["ok"] is True
+    assert result["already_claimed"] is False
+    assert result["no_campaign"] is True
+    assert "尚未到账" in result["message"]
+    assert "不能代领" in result["message"]
+
+
+def test_claim_400_includes_upstream_message(isolated_db, monkeypatch):
+    from providers.qwenwork import checkin
+
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-400",
+            "provider": "qwenwork",
+            "access_token": "tok",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+
+    class FakeResponse:
+        status_code = 400
+
+        def json(self):
+            return {"errorCode": "BAD_REQUEST", "errorMessage": "unexpected body"}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            assert url.endswith("/api/v1/adapter/user/wallets")
+            return FakeResponse()
+
+    monkeypatch.setattr(checkin.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(checkin.claim_checkin(db.get_account(account_id)))
+    assert result["ok"] is False
+    assert result["status_code"] == 400
+    assert "unexpected body" in result["message"]
+
+
+def test_refresh_uses_openapi_identity_without_bearer(isolated_db, monkeypatch):
+    from providers.qwenwork import token
+
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-refresh",
+            "provider": "qwenwork",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at": 1_700_000_000_000,
+        }
+    )
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "device_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+                "refresh_token_expires_in": 86400,
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["headers"], kwargs["json"]))
+            return FakeResponse()
+
+    monkeypatch.setattr(token.httpx, "AsyncClient", FakeClient)
+    fresh = asyncio.run(token.refresh_account(db.get_account(account_id)))
+    assert calls[0][0].endswith("/api/v1/deviceToken/refresh")
+    assert calls[0][1]["X-QwenWork-Version"] == "1.3.1"
+    assert calls[0][1]["X-QwenWork-App-Mode"] == "standard"
+    assert calls[0][1]["User-Agent"] == "qoderwork/1.3.1"
+    assert "Authorization" not in calls[0][1]
+    assert calls[0][2] == {"refresh_token": "old-refresh", "target": "c"}
+    assert fresh["access_token"] == "new-access"
+    assert fresh["refresh_token"] == "new-refresh"
+
+
+def test_refresh_401_explains_claim_can_still_succeed(isolated_db, monkeypatch):
+    from providers.qwenwork import token
+
+    expires_at = int((time.time() + 3 * 86400) * 1000)
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-dead-refresh",
+            "provider": "qwenwork",
+            "access_token": "still-valid",
+            "refresh_token": "dead-refresh",
+            "expires_at": expires_at,
+        }
+    )
+
+    class FakeResponse:
+        status_code = 401
+
+        def json(self):
+            return {
+                "errorCode": "INVALID_REFRESH_TOKEN",
+                "errorMessage": "refresh token is invalid",
+                "upstreamError": {"code": "invalid_grant"},
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(token.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(token, "read_official_session", lambda path=None: None)
+    with pytest.raises(token.QwenWorkAuthError) as caught:
+        asyncio.run(token.refresh_account(db.get_account(account_id)))
+    assert "续期令牌已失效" in str(caught.value)
+    assert "领取不受影响" in str(caught.value)
+    saved = db.get_account(account_id)
+    assert saved["access_token"] == "still-valid"
+    assert saved["refresh_token"] == "dead-refresh"
+
+
+def test_refresh_retries_a_newer_official_session(isolated_db, monkeypatch):
+    from providers.qwenwork import token
+
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-stale",
+            "provider": "qwenwork",
+            "access_token": "old-access",
+            "refresh_token": "stale-refresh",
+            "expires_at": 1_700_000_000_000,
+        }
+    )
+    used = []
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def json(self):
+            if self.status_code >= 400:
+                return {"errorCode": "INVALID_REFRESH_TOKEN", "errorMessage": "refresh token is invalid"}
+            return {"token": "fresh-access", "refresh_token": "fresh-refresh", "expires_in": 60}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            refresh = kwargs["json"]["refresh_token"]
+            used.append(refresh)
+            return FakeResponse(401 if refresh == "stale-refresh" else 200)
+
+    monkeypatch.setattr(token.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        token,
+        "read_official_session",
+        lambda path=None: {
+            "uid": "qw-stale",
+            "access_token": "official-access",
+            "refresh_token": "official-refresh",
+            "expires_at": 1_800_000_000_000,
+        },
+    )
+    fresh = asyncio.run(token.refresh_account(db.get_account(account_id)))
+    assert used == ["stale-refresh", "official-refresh"]
+    assert fresh["access_token"] == "fresh-access"
+    assert fresh["refresh_token"] == "fresh-refresh"
+
+
+def test_provider_checkin_is_enabled():
+    from providers.qwenwork import PROVIDER
+
+    assert PROVIDER.checkin_supported is True
+    assert hasattr(PROVIDER, "claim_checkin")
+    assert hasattr(PROVIDER, "fetch_checkin")

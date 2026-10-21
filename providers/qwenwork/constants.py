@@ -16,6 +16,19 @@ CHAT_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation"
 CHAT_QUERY = "FetchKeys=llm_model_result&AgentId=agent_common"
 REFRESH_PATH = "/api/v1/deviceToken/refresh"
 ACCOUNT_CONTEXT_PATH = "/api/v1/adapter/user/account-context"
+# OpenAPI routes reject the frozen 1.0.4 chat identity. Refresh follows the
+# 1.3.1 desktop: qoderwork user agent, client headers, and no Authorization.
+# Claim keeps the captured QwenWork user agent; a QwenWork UA on claim is required.
+WALLETS_PATH = "/api/v1/adapter/user/wallets"
+# The 1.3.1 claim route now returns "404 page not found" after authentication.
+# Daily credits are issued by QwenWork, so the gateway only reads wallets.
+DAILY_CREDIT_NOTICE_CLAIM_PATH = "/api/v1/adapter/user/daily-credit-notice/claim"
+CLAIM_IDE_VERSION = "1.3.1"
+CLAIM_RELEASE_VERSION = "1.3.1-26101419"
+CLAIM_BUILD = "26101419"
+CLAIM_APP_MODE = "standard"
+CLAIM_USER_AGENT = "QwenWork/1.3.1"
+OPENAPI_USER_AGENT = "qoderwork/1.3.1"
 MODELS_PATH = "/api/v2/model/list"
 
 IDE_VERSION = "1.0.4"

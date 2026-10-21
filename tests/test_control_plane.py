@@ -40,6 +40,12 @@ def test_claim_one_uses_traework_claim_not_workbuddy(monkeypatch):
     assert result["claimed"] is True
 
 
+def test_any_channel_key_is_allowed(isolated_db):
+    import server
+
+    assert server._validate_key_channel("*") == "*"
+
+
 def test_create_key_requires_channel(isolated_db):
     from fastapi import HTTPException
     import server
@@ -99,9 +105,9 @@ def test_preview_import_roundtrip(isolated_db, tmp_path, monkeypatch):
 
 def test_discover_marks_docker_host_auth_limited(isolated_db, monkeypatch):
     monkeypatch.setenv("CB_DOCKER", "1")
-    qclaw = control_plane.discover("qclaw")
-    assert qclaw["runtime"]["container"] is True
-    assert qclaw["runtime"]["host_auth_limited"] is True
+    qwenwork = control_plane.discover("qwenwork")
+    assert qwenwork["runtime"]["container"] is True
+    assert qwenwork["runtime"]["host_auth_limited"] is True
     workbuddy = control_plane.discover("workbuddy")
     assert workbuddy["runtime"]["container"] is True
     assert workbuddy["runtime"]["host_auth_limited"] is False
@@ -114,40 +120,11 @@ def test_credit_summary_has_null_total(isolated_db):
     assert any(item["id"] == "workbuddy" for item in payload["channels"])
 
 
-def test_credit_summary_qclaw_uses_token_unit(isolated_db, monkeypatch):
+def test_credit_summary_skips_retired_qclaw(isolated_db, monkeypatch):
     monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy,qclaw")
-    db.add_account(
-        {
-            "name": "qc",
-            "uid": "q1",
-            "provider": "qclaw",
-            "access_token": "sk",
-            "status": "active",
-        }
-    )
-    from providers.protocol import QuotaSnapshot
-    from providers.qclaw import PROVIDER
-
-    async def fake_quota(account):
-        return QuotaSnapshot(
-            ok=True,
-            channel="qclaw",
-            account_id=int(account.get("id") or 0),
-            unit="token",
-            remaining=40,
-            extra={"used": 10, "limit": 50},
-            unsupported=False,
-        )
-
-    monkeypatch.setattr(PROVIDER, "fetch_quota", fake_quota)
     payload = asyncio.run(control_plane.credit_summary())
     assert payload["total_balance"] is None
-    qclaw = next(item for item in payload["channels"] if item["id"] == "qclaw")
-    assert qclaw["unit"] == "token"
-    assert qclaw["remaining"] == 40
-    assert qclaw["used"] == 10
-    assert qclaw["limit"] == 50
-    assert qclaw["unsupported"] is False
+    assert all(item["id"] != "qclaw" for item in payload["channels"])
     workbuddy = next(item for item in payload["channels"] if item["id"] == "workbuddy")
     assert workbuddy["unit"] == "credit"
 

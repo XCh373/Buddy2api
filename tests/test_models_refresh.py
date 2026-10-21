@@ -23,7 +23,7 @@ TRAE_DOUBAO_TURBO = "Doubao-Seed-2.1-Turbo"
 TRAE_DOUBAO_CODE = "Doubao-Seed-2.0-Code"
 
 
-@pytest.mark.parametrize("channel", ["workbuddy", "qclaw", "qwenwork", "traework"])
+@pytest.mark.parametrize("channel", ["workbuddy", "qwenwork", "traework"])
 def test_capacity_survives_supplier_catalog_and_public_listing(channel, isolated_db, all_channels):
     import catalog
     from providers.workbuddy.models import parse_supplier_models as wb
@@ -46,13 +46,27 @@ def test_capacity_survives_supplier_catalog_and_public_listing(channel, isolated
         assert prefixed["context_window"] == item["context_window"]
 
 
+def test_public_models_omit_channels_without_login(monkeypatch):
+    monkeypatch.setattr(server.db, "list_accounts", lambda provider=None: [
+        {"provider": "qoder", "access_token": "dt-present"},
+        {"provider": "workbuddy-i", "access_token": ""},
+    ])
+    monkeypatch.setattr(server, "collect_v1_models", lambda: [
+        {"id": "qoder/Auto", "channel": "qoder"},
+        {"id": "qoder-i/Auto", "channel": "qoder-i"},
+        {"id": "workbuddy-i/glm-5.2", "channel": "workbuddy-i"},
+        {"id": "glm-5.2", "channel": "workbuddy"},
+    ])
+    assert {item["id"] for item in server.public_v1_models()} == {"qoder/Auto"}
+
+
 def test_all_channels_publish_capacity_defaults_without_persisting_guesses(isolated_db, all_channels):
     import catalog
 
-    for channel in ("workbuddy", "qclaw", "qwenwork", "traework"):
+    for channel in ("workbuddy", "qwenwork", "traework"):
         catalog.save_catalog(channel, [{"id": "unknown"}])
     items = server.collect_v1_models()
-    assert len(items) == 5
+    assert len(items) == 4
     for item in items:
         assert item["context_window"] == 262144
         assert item["max_output_tokens"] == 32768
@@ -129,13 +143,9 @@ def test_empty_or_invalid_reasoning_is_not_published():
 
 def test_other_channels_do_not_invent_reasoning_from_thinking_tags(isolated_db, all_channels):
     import catalog
-    from providers.qclaw.jprx import parse_model_list
     from providers.qwenwork.models import parse_supplier_models as parse_qwen
     from providers.traework.models import parse_supplier_models as parse_trae
 
-    catalog.save_catalog("qclaw", catalog.normalize_models(parse_model_list({
-        "model_status_list": [{"id": "pool-hy3-preview", "capabilities": ["深度思考"]}],
-    })))
     catalog.save_catalog("qwenwork", catalog.normalize_models(parse_qwen({
         "qwork": [{"key": "pro", "enable": True, "is_reasoning": False}],
     })))
@@ -146,7 +156,7 @@ def test_other_channels_do_not_invent_reasoning_from_thinking_tags(isolated_db, 
         }]}]},
     })))
     public = {item["id"]: item for item in server.collect_v1_models()}
-    for model_id in ("qclaw/pool-hy3-preview", "qwenwork/pro", "traework/glm-5.3"):
+    for model_id in ("qwenwork/pro", "traework/glm-5.3"):
         assert "reasoning" not in public[model_id]
         assert "supportsReasoning" not in public[model_id]
 
@@ -297,7 +307,7 @@ def isolated_db(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def all_channels(monkeypatch):
-    monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy,qclaw,qwenwork,traework")
+    monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy,qwenwork,traework")
     yield
     monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
 
@@ -398,7 +408,7 @@ def test_web_and_cli_version_come_from_version_py():
     assert "__APP_VERSION__" in html
     assert "v2.1." not in html
     rendered = server._render_index_html()
-    assert f"Local model gateway · v{VERSION}" in rendered
+    assert f"wicm84266964 · v{VERSION}" in rendered
     assert "__APP_VERSION__" not in rendered
     assert f"Buddy 2 API v{{VERSION}}" in Path(server.__file__).read_text(encoding="utf-8")
 
@@ -463,15 +473,12 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     assert TRAE_NEW_DOUBAO not in TRAE_STATIC
     assert TRAE_DOUBAO_TURBO in TRAE_STATIC
 
-    qclaw = providers.get_provider("qclaw")
     traework = providers.get_provider("traework")
     workbuddy = providers.get_provider("workbuddy")
     qwenwork = providers.get_provider("qwenwork")
 
-    assert QCLAW_NEW_ID not in _ids(qclaw.list_models())
     assert TRAE_NEW_DOUBAO not in _ids(traework.list_models())
     assert WB_NEW_ID not in _ids(workbuddy.list_models())
-    assert not qclaw.accepts_model(QCLAW_NEW_ID)
     assert not traework.accepts_model(TRAE_NEW_DOUBAO)
     assert not workbuddy.accepts_model(WB_NEW_ID)
 
@@ -491,12 +498,11 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     result = asyncio.run(server.admin_refresh_models())
     sources = _by_channel(result)
 
-    assert sources["qclaw"]["mode"] == "live"
+    assert "qclaw" not in sources
     assert sources["traework"]["mode"] == "live"
     assert sources["workbuddy"]["mode"] == "live"
     assert sources["qwenwork"]["mode"] == "live"
 
-    assert QCLAW_NEW_ID in _ids(sources["qclaw"]["models"])
     assert TRAE_NEW_DOUBAO in _ids(sources["traework"]["models"])
     assert TRAE_DOUBAO_TURBO in _ids(sources["traework"]["models"])
 
@@ -516,7 +522,6 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     assert TRAE_NEW_DOUBAO not in qwen_ids
     assert QCLAW_NEW_ID not in qwen_ids
 
-    assert any("/data/4320/forward" in url for method, url in requested if method == "POST")
     assert any("/api/remote/v1/models" in url for method, url in requested if method == "GET")
     assert any("/api/v2/model/list" in url for method, url in requested if method == "GET")
     assert any("/v2/enterprises/personal/models" in url for method, url in requested if method == "GET")
@@ -524,11 +529,9 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     assert copilot_urls
     assert all("/v2/enterprises/personal/models" in url for url in copilot_urls)
 
-    assert QCLAW_NEW_ID in _ids(qclaw.list_models())
     assert TRAE_NEW_DOUBAO in _ids(traework.list_models())
     assert QWEN_NEW_ID in _ids(qwenwork.list_models())
     assert WB_NEW_ID in _ids(workbuddy.list_models())
-    assert qclaw.accepts_model(QCLAW_NEW_ID)
     assert traework.accepts_model(TRAE_NEW_DOUBAO)
     assert qwenwork.accepts_model(QWEN_NEW_ID)
     assert qwenwork.accepts_model("pro")
@@ -537,17 +540,12 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     assert not workbuddy.accepts_model("hunyuan-image-v3.0")
     assert not workbuddy.accepts_model(TRAE_NEW_DOUBAO)
     assert not workbuddy.accepts_model(TRAE_DOUBAO_TURBO)
-    assert not qclaw.accepts_model(TRAE_NEW_DOUBAO)
     assert not qwenwork.accepts_model(TRAE_NEW_DOUBAO)
     assert not qwenwork.accepts_model(QCLAW_NEW_ID)
 
     bound = router.bind({"model": "traework/" + TRAE_NEW_DOUBAO}, {"default_channel": "traework"})
     assert bound.channel == "traework"
     assert bound.inner == TRAE_NEW_DOUBAO
-    bound = router.bind({"model": "qclaw/" + QCLAW_NEW_ID}, {"default_channel": "qclaw"})
-    assert bound.channel == "qclaw"
-    assert bound.inner == QCLAW_NEW_ID
-
     def attempt_chat(payload, key):
         bound = router.bind(payload, key)
         return asyncio.run(router.chat_after_bind(bound, payload, key))
@@ -567,7 +565,7 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     data = payload["data"]
     by_id = {item["id"]: item for item in data}
 
-    assert by_id["qclaw/" + QCLAW_NEW_ID]["channel"] == "qclaw"
+    assert "qclaw/" + QCLAW_NEW_ID not in by_id
     assert by_id["traework/" + TRAE_NEW_DOUBAO]["channel"] == "traework"
     assert by_id["traework/" + TRAE_DOUBAO_TURBO]["channel"] == "traework"
     assert TRAE_NEW_DOUBAO not in by_id
@@ -604,31 +602,31 @@ def test_manual_add_goes_to_selected_channel(isolated_db, all_channels):
 
     custom_qw = "qwork-user-added"
     custom_wb = "wb-user-added"
-    custom_qc = "qclaw-user-added"
+    custom_tw = "trae-user-added"
 
     qwenwork = providers.get_provider("qwenwork")
     workbuddy = providers.get_provider("workbuddy")
-    qclaw = providers.get_provider("qclaw")
+    traework = providers.get_provider("traework")
 
     catalog.upsert_model("qwenwork", custom_qw, "Qwen extra")
     catalog.upsert_model("workbuddy", custom_wb, "WB extra")
-    catalog.upsert_model("qclaw", "qclaw/" + custom_qc, "QC extra")
+    catalog.upsert_model("traework", custom_tw, "Trae extra")
 
     assert qwenwork.accepts_model(custom_qw)
     assert not workbuddy.accepts_model(custom_qw)
-    assert not qclaw.accepts_model(custom_qw)
+    assert not traework.accepts_model(custom_qw)
     assert workbuddy.accepts_model(custom_wb)
     assert not qwenwork.accepts_model(custom_wb)
-    assert qclaw.accepts_model(custom_qc)
-    assert not workbuddy.accepts_model(custom_qc)
+    assert traework.accepts_model(custom_tw)
+    assert not workbuddy.accepts_model(custom_tw)
 
     by_id = {item["id"]: item for item in server.collect_v1_models()}
     assert by_id["qwenwork/" + custom_qw]["channel"] == "qwenwork"
     assert custom_qw not in by_id
     assert custom_wb in by_id
     assert by_id[custom_wb]["channel"] == "workbuddy"
-    assert by_id["qclaw/" + custom_qc]["channel"] == "qclaw"
-    assert custom_qc not in by_id
+    assert by_id["traework/" + custom_tw]["channel"] == "traework"
+    assert custom_tw not in by_id
 
     snap = {item["channel"]: item for item in catalog.catalog_snapshot()["sources"]}
     qw_manual = [item for item in snap["qwenwork"]["models"] if item.get("id") == custom_qw]
@@ -645,12 +643,12 @@ def test_manual_add_goes_to_selected_channel(isolated_db, all_channels):
 def test_manual_extra_survives_live_refresh(isolated_db, all_channels, monkeypatch):
     import catalog
 
-    extra = "qclaw-hand-added"
+    extra = "trae-hand-added"
     wb_extra = "wb-hand-added"
-    catalog.upsert_model("qclaw", extra, "Hand added")
+    catalog.upsert_model("traework", extra, "Hand added")
     catalog.upsert_model("workbuddy", wb_extra, "WB hand added")
-    assert extra not in _ids(QCLAW_STATIC)
-    assert providers.get_provider("qclaw").accepts_model(extra)
+    assert extra not in _ids(TRAE_STATIC)
+    assert providers.get_provider("traework").accepts_model(extra)
     assert providers.get_provider("workbuddy").accepts_model(wb_extra)
 
     _seed_live_accounts()
@@ -659,11 +657,9 @@ def test_manual_extra_survives_live_refresh(isolated_db, all_channels, monkeypat
     result = asyncio.run(server.admin_refresh_models())
     sources = _by_channel(result)
 
-    assert sources["qclaw"]["mode"] == "live"
-    assert extra in _ids(sources["qclaw"]["models"])
-    assert QCLAW_NEW_ID in _ids(sources["qclaw"]["models"])
-    assert providers.get_provider("qclaw").accepts_model(extra)
-    assert providers.get_provider("qclaw").accepts_model(QCLAW_NEW_ID)
+    assert sources["traework"]["mode"] == "live"
+    assert extra in _ids(sources["traework"]["models"])
+    assert providers.get_provider("traework").accepts_model(extra)
     assert extra not in _ids(providers.get_provider("workbuddy").list_models())
     assert sources["workbuddy"]["mode"] == "live"
     assert wb_extra in _ids(sources["workbuddy"]["models"])
