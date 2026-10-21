@@ -176,21 +176,31 @@ def _attach_runtime(payload: dict, channel: str) -> dict:
     return payload
 
 
-def workbuddy_discover(auth_dir: str | None = None) -> dict:
+def workbuddy_discover(auth_dir: str | None = None, channel: str = "workbuddy") -> dict:
+    wanted = "workbuddy-i" if channel == "workbuddy-i" else "workbuddy"
     payload = auth_manager.discover_auth_files(auth_dir)
     files = []
     for item in payload.get("files") or []:
         row = dict(item)
-        row["channel"] = "workbuddy"
+        if auth_manager.workbuddy_channel_for_domain(str(row.get("domain") or "")) != wanted:
+            continue
+        row["channel"] = wanted
         files.append(row)
     payload["files"] = files
-    payload["preview_token"] = issue_preview("workbuddy", files)
-    return _attach_runtime(payload, "workbuddy")
+    payload["file_count"] = len(files)
+    payload["valid_count"] = sum(1 for item in files if item.get("valid"))
+    payload["importable_count"] = sum(
+        1 for item in files if item.get("valid") and not item.get("already_imported")
+    )
+    payload["preview_token"] = issue_preview(wanted, files)
+    return _attach_runtime(payload, wanted)
 
 
 def discover(channel: str | None = None, auth_dir: str | None = None) -> dict:
-    if not channel or channel == "workbuddy":
-        return workbuddy_discover(auth_dir)
+    if not channel or channel in {"workbuddy", "workbuddy-i"}:
+        return workbuddy_discover(auth_dir, channel or "workbuddy")
+    if providers.is_retired_channel(channel):
+        raise ValueError(providers.retired_message(channel))
     provider = providers.get_provider(channel)
     if provider is None:
         raise ValueError(f"Channel '{channel}' is not enabled")
@@ -222,13 +232,14 @@ def _is_under(path: Path, roots: list[Path]) -> bool:
 
 def _upsert_workbuddy(parsed: dict, auth_path: str) -> str:
     parsed = dict(parsed)
-    parsed["provider"] = "workbuddy"
+    parsed["provider"] = auth_manager.workbuddy_channel_for_domain(str(parsed.get("domain") or ""))
     extra = parsed.get("extra") if isinstance(parsed.get("extra"), dict) else {}
     extra["auth_path"] = auth_path
     parsed["extra"] = extra
     uid = str(parsed.get("uid") or "")
     if uid:
-        for row in db.list_accounts(provider="workbuddy"):
+        rows = db.list_accounts(provider="workbuddy") + db.list_accounts(provider="workbuddy-i")
+        for row in rows:
             if str(row.get("uid") or "") == uid:
                 patch = {key: parsed[key] for key in _TOKEN_FIELDS if key in parsed}
                 db.update_account(row["id"], patch)
@@ -265,8 +276,10 @@ def import_channel(channel: str, preview_token: str, paths: list[str] | None, au
     preview = lookup_preview(preview_token, channel)
     if not paths:
         paths = list((preview.get("paths") or {}).values())
-    if channel == "workbuddy":
+    if channel in {"workbuddy", "workbuddy-i"}:
         return import_workbuddy(paths, preview, auth_dir)
+    if providers.is_retired_channel(channel):
+        raise ValueError(providers.retired_message(channel))
     provider = providers.get_provider(channel)
     if provider is None:
         raise ValueError(f"Channel '{channel}' is not enabled")
@@ -366,7 +379,7 @@ async def _summarize_workbuddy_credit(provider, accounts: list[dict], force: boo
     ok = [row for row in resources if row.get("ok")]
     remaining = round(sum(float(row.get("total_dosage") or row.get("available_total") or 0) for row in ok), 4)
     row = {
-        "id": "workbuddy",
+        "id": getattr(provider, "id", "workbuddy"),
         "display_name": getattr(provider, "display_name", "workbuddy"),
         "unit": "credit",
         "remaining": remaining,
@@ -453,7 +466,7 @@ async def credit_summary(force: bool = False) -> dict:
     async def one_channel(channel: str):
         provider = providers.get_provider(channel)
         accounts = await _channel_accounts(channel)
-        if channel == "workbuddy":
+        if _workbuddy_family(channel):
             row, resources = await _summarize_workbuddy_credit(provider, accounts, force)
             return row, resources
         return await _summarize_quota_channel(channel, provider, accounts), []
@@ -465,8 +478,11 @@ async def credit_summary(force: bool = False) -> dict:
     workbuddy_resources = []
     for row, resources in gathered:
         channels.append(row)
-        if row.get("id") == "workbuddy":
-            workbuddy_resources = resources
+        if _workbuddy_family(str(row.get("id") or "")):
+            for item in resources:
+                if isinstance(item, dict) and not item.get("channel"):
+                    item["channel"] = row.get("id")
+            workbuddy_resources.extend(resources)
     now_ts = int(time.time())
     ok_resources = [row for row in workbuddy_resources if row.get("ok")]
     stale_count = sum(1 for row in workbuddy_resources if row.get("stale"))
@@ -478,7 +494,7 @@ async def credit_summary(force: bool = False) -> dict:
         item = {
             "account_id": row.get("account_id"),
             "account_name": row.get("account_name"),
-            "channel": "workbuddy",
+            "channel": row.get("channel") or "workbuddy",
             "balance": round(balance, 4),
             "expiring_30d_total": round(float(row.get("expiring_30d_total") or 0), 4),
             "next_expire_time": row.get("next_expire_time") or "",
@@ -529,9 +545,13 @@ def _checkin_channel_error(account: dict, channel: str, message: str) -> dict:
     }
 
 
+def _workbuddy_family(channel: str) -> bool:
+    return channel in {"workbuddy", "workbuddy-i"}
+
+
 async def checkin_status_one(account: dict, force: bool = False) -> dict:
     channel = str(account.get("provider") or "workbuddy")
-    if channel != "workbuddy":
+    if not _workbuddy_family(channel):
         provider = providers.get_provider(channel)
         if provider is None:
             return _checkin_channel_error(account, channel, f"Channel '{channel}' is not enabled")
@@ -547,7 +567,7 @@ async def checkin_status_one(account: dict, force: bool = False) -> dict:
 
 async def claim_one(account: dict) -> dict:
     channel = str(account.get("provider") or "workbuddy")
-    if channel != "workbuddy":
+    if not _workbuddy_family(channel):
         provider = providers.get_provider(channel)
         if provider is None:
             return _checkin_channel_error(account, channel, f"Channel '{channel}' is not enabled")
@@ -600,7 +620,13 @@ async def checkin_status_all(force: bool = False) -> dict:
         "ok": sum(1 for row in results if row.get("ok")),
         "claimed": sum(1 for row in results if row.get("claimed")),
         "already_claimed": sum(1 for row in results if row.get("already_claimed") or row.get("today_checked_in")),
-        "available": sum(1 for row in results if row.get("ok") and not (row.get("already_claimed") or row.get("today_checked_in"))),
+        "available": sum(
+            1
+            for row in results
+            if row.get("ok")
+            and not row.get("no_campaign")
+            and not (row.get("already_claimed") or row.get("today_checked_in"))
+        ),
         "failed": sum(1 for row in results if not row.get("ok")),
         "stale": sum(1 for row in results if row.get("stale")),
         "results": results,
@@ -659,7 +685,7 @@ async def refresh_one(account: dict, *, allow_inactive: bool = True) -> dict:
     }
     if not allow_inactive and account.get("status") == "inactive":
         return {**base, "ok": False, "skipped": True, "reason": "inactive", "message": "账号已禁用，未刷新", "status": "inactive"}
-    if channel == "workbuddy":
+    if _workbuddy_family(channel):
         result = await auth_manager.refresh_token_result(account)
         result["status_text"] = "ok" if result.get("ok") else "failed"
         return result

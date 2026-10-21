@@ -1,4 +1,4 @@
-"""Channel registry. WorkBuddy, QClaw, QwenWork, and TraeWork are enabled by default."""
+"""Channel registry. WorkBuddy, QwenWork, Qoder, TraeWork, Loomy, and Xiaohuanxiong are enabled by default."""
 
 from __future__ import annotations
 
@@ -7,21 +7,40 @@ import os
 from providers.protocol import (
     KNOWN_CHANNEL_IDS,
     KNOWN_CHANNEL_SET,
+    RETIRED_CHANNEL_IDS,
+    RETIRED_CHANNEL_MESSAGE,
     ChannelId,
     Provider,
 )
-from providers.qclaw import PROVIDER as QCLAW_PROVIDER
+from providers.loomy import PROVIDER as LOOMY_PROVIDER
+from providers.qoder import CN as QODER_PROVIDER
+from providers.qoder import INTL as QODER_I_PROVIDER
 from providers.qwenwork import PROVIDER as QWENWORK_PROVIDER
 from providers.traework import PROVIDER as TRAEWORK_PROVIDER
+from providers.workbuddy import INTL as WORKBUDDY_I_PROVIDER
 from providers.workbuddy import PROVIDER as WORKBUDDY_PROVIDER
+from providers.xiaohuanxiong import PROVIDER as XIAOHUANXIONG_PROVIDER
 
-DEFAULT_PROVIDER_IDS: tuple[str, ...] = ("workbuddy", "qclaw", "qwenwork", "traework")
+DEFAULT_PROVIDER_IDS: tuple[str, ...] = (
+    "workbuddy",
+    "workbuddy-i",
+    "qwenwork",
+    "qoder",
+    "qoder-i",
+    "traework",
+    "loomy",
+    "xiaohuanxiong",
+)
 
 _LOADED: dict[str, Provider] = {
     "workbuddy": WORKBUDDY_PROVIDER,
-    "qclaw": QCLAW_PROVIDER,
+    "workbuddy-i": WORKBUDDY_I_PROVIDER,
     "qwenwork": QWENWORK_PROVIDER,
+    "qoder": QODER_PROVIDER,
+    "qoder-i": QODER_I_PROVIDER,
     "traework": TRAEWORK_PROVIDER,
+    "loomy": LOOMY_PROVIDER,
+    "xiaohuanxiong": XIAOHUANXIONG_PROVIDER,
 }
 
 
@@ -30,6 +49,9 @@ def _parse_enabled() -> list[str]:
     if not raw:
         return list(DEFAULT_PROVIDER_IDS)
     parts = [item.strip() for item in raw.split(",") if item.strip()]
+    if not parts:
+        return list(DEFAULT_PROVIDER_IDS)
+    parts = [item for item in parts if item not in RETIRED_CHANNEL_IDS]
     if not parts:
         return list(DEFAULT_PROVIDER_IDS)
     unknown = [item for item in parts if item not in KNOWN_CHANNEL_SET]
@@ -54,6 +76,23 @@ def enabled_provider_ids() -> list[str]:
 
 def is_known_channel(channel: str) -> bool:
     return channel in KNOWN_CHANNEL_SET
+
+
+def is_retired_channel(channel: str) -> bool:
+    return channel in RETIRED_CHANNEL_IDS
+
+
+def retired_message(channel: str = "qclaw") -> str:
+    if channel == "qclaw":
+        return RETIRED_CHANNEL_MESSAGE
+    return f"Channel '{channel}' is retired."
+
+
+def ignored_retired_ids() -> list[str]:
+    raw = (os.environ.get("CB_GATEWAY_PROVIDERS") or "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip() in RETIRED_CHANNEL_IDS]
 
 
 def is_channel_enabled(channel: str) -> bool:

@@ -42,7 +42,7 @@ import responses
 import providers
 import router
 import control_plane
-from providers.protocol import KNOWN_CHANNEL_SET
+from providers.protocol import KNOWN_CHANNEL_IDS, KNOWN_CHANNEL_SET
 from providers.qclaw.store import default_guid, upsert_account as upsert_qclaw_account
 from reasoning_controls import (
     InvalidReasoningControl,
@@ -112,7 +112,7 @@ ADMIN_TOKEN: str = ""
 ALLOW_NO_ADMIN_AUTH = False
 LOCAL_MODE = False
 ALLOW_UNAUTHENTICATED_API = _env_flag("CB_GATEWAY_ALLOW_UNAUTHENTICATED_API", False)
-MAX_BODY_BYTES = max(1024, _env_int("CB_GATEWAY_MAX_BODY_BYTES", 10 * 1024 * 1024))
+MAX_BODY_BYTES = max(1024, _env_int("CB_GATEWAY_MAX_BODY_BYTES", 32 * 1024 * 1024))
 _CURRENT_REQUEST: contextvars.ContextVar[Request | None] = contextvars.ContextVar("current_request", default=None)
 
 
@@ -237,10 +237,55 @@ def _reserve_client_quota(key_info: dict | None):
         )
 
 
+def _normalize_domain_pattern(raw) -> str:
+    """Accept only `*`, `*.suffix`, or an exact host; normalize to lower-case."""
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail="account_domain_filter entries must be strings")
+    pattern = raw.strip().lower()
+    if not pattern:
+        raise HTTPException(status_code=400, detail="account_domain_filter entries must be non-empty")
+    if pattern == "*":
+        return pattern
+    if pattern.startswith("*."):
+        suffix = pattern[2:]
+        host = auth_manager._host_from(suffix)
+        if not suffix or "*" in suffix or host != suffix:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid account_domain_filter pattern: {raw!r} "
+                       "(use an exact host, '*.suffix', or '*')",
+            )
+        return pattern
+    # Same host parsing as account["domain"], so a saved pattern always names a
+    # host the picker can actually compare against.
+    host = auth_manager._host_from(pattern)
+    if not host or "*" in host or " " in host:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid account_domain_filter pattern: {raw!r} "
+                   "(use an exact host, '*.suffix', or '*')",
+        )
+    return host
+
+
+def _validate_account_domain_filter(raw) -> list | None:
+    """API-key scoped account domain patterns (e.g. ["*.workbuddy.ai"]); empty -> None; else 400."""
+    if raw in (None, ""):
+        return None
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="account_domain_filter must be an array of strings")
+    patterns = [_normalize_domain_pattern(item) for item in raw]
+    return patterns or None
+
+
 def _validate_key_channel(channel: str) -> str:
     value = str(channel or "").strip()
     if not value:
         raise HTTPException(status_code=400, detail="default_channel is required")
+    if value == router.ANY_CHANNEL:
+        return value
+    if providers.is_retired_channel(value):
+        raise HTTPException(status_code=400, detail=providers.retired_message(value))
     if value not in KNOWN_CHANNEL_SET:
         raise HTTPException(status_code=400, detail=f"Unknown channel '{value}'")
     if not providers.is_channel_enabled(value) or providers.get_provider(value) is None:
@@ -383,6 +428,20 @@ def collect_v1_models() -> list[dict]:
     return data
 
 
+def channels_with_login() -> set[str]:
+    found = set()
+    for account in db.list_accounts():
+        if str(account.get("access_token") or "").strip():
+            found.add(str(account.get("provider") or ""))
+    return found
+
+
+def public_v1_models() -> list[dict]:
+    """Client catalog. A channel with no stored login is omitted."""
+    present = channels_with_login()
+    return [item for item in collect_v1_models() if item.get("channel") in present]
+
+
 @app.get("/v1/models")
 async def list_models(
     authorization: str | None = Header(default=None),
@@ -391,7 +450,7 @@ async def list_models(
     await run_in_threadpool(
         lambda: _check_client_auth(authorization, x_api_key, consume_quota=False)
     )
-    return {"object": "list", "data": collect_v1_models()}
+    return {"object": "list", "data": public_v1_models()}
 
 
 @app.post("/v1/chat/completions")
@@ -414,9 +473,6 @@ async def chat_completions(
         payload = normalize_chat_reasoning(payload)
     except InvalidReasoningControl as exc:
         raise _invalid_reasoning_http(exc) from exc
-    # Codex 类型 Key：自动应用内容清洗 + 工具过滤
-    if api_key_info and api_key_info.get("client_type") == "codex":
-        payload = responses.apply_codex_sanitize(payload)
 
     bound = router.bind_http(payload, api_key_info)
     _check_model_access(api_key_info, bound.original, bound.inner, bound.channel)
@@ -506,9 +562,14 @@ async def admin_channels(authorization: str | None = Header(default=None)):
             "loaded": provider is not None,
             "checkin_supported": bool(getattr(provider, "checkin_supported", False)),
             "env_locked": env_set,
-            "host_auth_limited": bool(in_container and channel in {"qclaw", "qwenwork"}),
+            "host_auth_limited": bool(
+                in_container and channel in {"qclaw", "qwenwork", "loomy", "xiaohuanxiong"}
+            ),
         })
-    return {"channels": items, "known": list(KNOWN_CHANNEL_SET)}
+    return {
+        "channels": items,
+        "known": [item for item in KNOWN_CHANNEL_IDS if not providers.is_retired_channel(item)],
+    }
 
 
 @app.get("/admin/stats")
@@ -609,6 +670,8 @@ async def admin_add_account(
     data = await _read_json_object(request)
     provider_id = str(data.get("provider") or data.get("channel") or "").strip()
     if provider_id and provider_id != "workbuddy":
+        if providers.is_retired_channel(provider_id):
+            raise HTTPException(status_code=400, detail=providers.retired_message(provider_id))
         provider = providers.get_provider(provider_id)
         if provider is None:
             raise HTTPException(status_code=400, detail=f"Channel '{provider_id}' is not enabled")
@@ -644,10 +707,7 @@ async def admin_add_account(
 
 
 def _qclaw_provider():
-    provider = providers.get_provider("qclaw")
-    if provider is None:
-        raise HTTPException(status_code=400, detail="Channel 'qclaw' is not enabled")
-    return provider
+    raise HTTPException(status_code=400, detail=providers.retired_message("qclaw"))
 
 
 @app.post("/admin/qclaw/import-path")
@@ -720,9 +780,11 @@ async def admin_workbuddy_login_start(
     authorization: str | None = Header(default=None),
 ):
     _check_admin(authorization)
-    provider = _workbuddy_provider()
     data = await _read_json_object(request, allow_empty=True)
     realm = str((data or {}).get("realm") or "cn").strip().lower()
+    provider = providers.get_provider("workbuddy-i" if realm == "global" else "workbuddy")
+    if provider is None:
+        raise HTTPException(status_code=400, detail="WorkBuddy channel is not enabled")
     if realm not in {"cn", "global"}:
         raise HTTPException(status_code=400, detail="realm must be cn or global")
     try:
@@ -840,7 +902,7 @@ async def admin_account_resources(
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     channel = str(account.get("provider") or "workbuddy")
-    if channel != "workbuddy":
+    if channel not in {"workbuddy", "workbuddy-i"}:
         provider = providers.get_provider(channel)
         if provider is None:
             raise HTTPException(status_code=400, detail=f"Channel '{channel}' is not enabled")
@@ -862,6 +924,7 @@ async def admin_account_resources(
         remaining = getattr(snapshot, "remaining", None)
         unsupported = bool(getattr(snapshot, "unsupported", False))
         credit_remaining = remaining if unit == "credit" and not unsupported else None
+        packages = extra.get("packages") if isinstance(extra.get("packages"), list) else []
         return {
             "ok": bool(getattr(snapshot, "ok", False)),
             "account_id": aid,
@@ -873,7 +936,7 @@ async def admin_account_resources(
             "available_total": credit_remaining,
             "unsupported": unsupported,
             "message": getattr(snapshot, "message", "") or "",
-            "packages": [],
+            "packages": packages,
         }
     return await auth_manager.fetch_account_resources(account, force=bool(force))
 
@@ -973,10 +1036,9 @@ async def admin_create_key(
     if "default_channel" not in data or data.get("default_channel") in (None, ""):
         raise HTTPException(status_code=400, detail="default_channel is required")
     default_channel = _validate_key_channel(data.get("default_channel"))
-    # 生成 sk- 前缀的 key
     key = f"sk-cb-{secrets.token_urlsafe(32)}"
     kid = db.add_api_key(
-        key, name, allowed, daily_limit, client_type, default_channel=default_channel
+        key, name, allowed, daily_limit, client_type, default_channel=default_channel,
     )
     return {"id": kid, "key": key, "status": "ok", "default_channel": default_channel}
 
@@ -1005,6 +1067,7 @@ async def admin_update_key(
         and (not isinstance(data["allowed_models"], list) or not all(isinstance(model, str) for model in data["allowed_models"]))
     ):
         raise HTTPException(status_code=400, detail="allowed_models must be an array of strings")
+    data.pop("account_domain_filter", None)
     db.update_api_key(kid, data)
     return {"status": "ok"}
 
@@ -1113,6 +1176,7 @@ async def admin_update_settings(
         "keepalive_hour",
         "auto_checkin_enabled",
         "auto_checkin_hour",
+        "loomy_context_budget",
     }
     unknown = set(data) - allowed_settings
     if unknown:
@@ -1137,6 +1201,14 @@ async def admin_update_settings(
             data[account_routing.SETTING] = account_routing.normalize_config(data[account_routing.SETTING])
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "loomy_context_budget" in data:
+        try:
+            budget = int(data["loomy_context_budget"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="loomy_context_budget must be an integer")
+        if budget < 0 or budget > 2_000_000:
+            raise HTTPException(status_code=400, detail="loomy_context_budget must be between 0 and 2000000")
+        data["loomy_context_budget"] = budget
     if "timeout" in data:
         try:
             data["timeout"] = max(5, min(600, int(data["timeout"])))
@@ -1519,6 +1591,9 @@ def main():
     sys.stderr.write(f"  监听: http://{args.host}:{args.port}\n")
     sys.stderr.write(f"  账号: {len(accounts)} 个 ({sum(1 for a in accounts if a['status']=='active')} active)\n")
     sys.stderr.write(f"  通道: {', '.join(providers.enabled_provider_ids())}\n")
+    retired = providers.ignored_retired_ids()
+    if retired:
+        sys.stderr.write("  已下架: QClaw。积分已转到 WorkBuddy，环境变量里的 qclaw 已忽略。\n")
     sys.stderr.write(
         f"  启动导入: {'on' if control_plane.auto_import_enabled() else 'off (CB_GATEWAY_AUTO_IMPORT=1 可打开)'}\n"
     )

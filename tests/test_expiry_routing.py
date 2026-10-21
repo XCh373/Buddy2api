@@ -102,7 +102,7 @@ def test_equal_expiry_preserves_sticky_and_consumption_advances_to_next_package(
     assert preview["accounts"][1]["expire_ts"] == NOW + 20 * 86400
 
 
-@pytest.mark.parametrize("provider", ["qclaw", "qwenwork", "traework"])
+@pytest.mark.parametrize("provider", ["qclaw", "qwenwork", "traework", "workbuddy-i"])
 def test_other_providers_never_read_expiry_cache(isolated_db, monkeypatch, provider):
     early = add_account("early", provider=provider)
     later = add_account("later", provider=provider, days=10)

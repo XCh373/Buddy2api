@@ -11,11 +11,12 @@ import router
 from providers.protocol import UnknownModel
 from providers.traework.chat import (
     _stream_once,
+    conversation_prompt,
     extract_assistant_text,
     extract_assistant_turn,
     translate_model,
 )
-from providers.traework.crypto import decrypt_tc_b64
+from providers.traework.crypto import decrypt_tc_b64, encrypt_tc_b64
 from providers.traework.store import parse_credentials, traework_auth_dirs
 
 
@@ -39,7 +40,16 @@ def traework_enabled(monkeypatch):
 
 def test_traework_in_default_registry(monkeypatch):
     monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
-    assert providers.enabled_provider_ids() == ["workbuddy", "qclaw", "qwenwork", "traework"]
+    assert providers.enabled_provider_ids() == [
+        "workbuddy",
+        "workbuddy-i",
+        "qwenwork",
+        "qoder",
+        "qoder-i",
+        "traework",
+        "loomy",
+        "xiaohuanxiong",
+    ]
     assert providers.get_provider("traework") is not None
     assert "traework" in providers._LOADED
 
@@ -117,6 +127,76 @@ def test_parse_supplier_models_official_grouped_list():
 
 def test_translate_auto():
     assert translate_model("auto") == "qwen-3.7-plus"
+
+
+def test_llm_body_renames_tool_calls_and_stringifies_parameters():
+    from providers.traework.llm_chat import build_llm_body
+
+    body = build_llm_body(
+        {
+            "model": "traework/glm-5.3-flash",
+            "messages": [
+                {"role": "developer", "content": "be brief"},
+                {"role": "user", "content": "read a.txt"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "hello"},
+                {"role": "tool", "tool_call_id": "missing", "content": "drop me"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "auto"},
+        },
+        "glm-5.3-flash",
+    )
+    assert body["function"] == "solo_work_lite"
+    assert body["config_name"] == "glm-5.3-flash"
+    assert body["tool_choice"] == "auto"
+    assert body["tools"][0]["function"]["parameters"] == '{"type":"object"}'
+    roles = [item["role"] for item in body["messages"]]
+    assert roles == ["system", "user", "assistant", "tool"]
+    assert "function_call" in body["messages"][2]["tool_calls"][0]
+    assert "function" not in body["messages"][2]["tool_calls"][0]
+    assert body["messages"][3]["content"] == [{"type": "text", "text": "hello"}]
+
+
+def test_llm_output_event_restores_function_field():
+    from providers.traework.llm_chat import parse_event
+
+    parsed = parse_event(
+        "output",
+        json.dumps({"response": "查一下", "tool_calls": [{"index": 0, "id": "call-1", "function_call": {"name": "read_file", "arguments": "{}", "namespace": "solo"}}]}),
+    )
+    assert parsed["text"] == "查一下"
+    assert parsed["tool_calls"][0]["function"]["name"] == "read_file"
+    assert "namespace" not in parsed["tool_calls"][0]["function"]
+
+
+def test_conversation_prompt_keeps_a_single_user_turn():
+    assert conversation_prompt({"messages": [{"role": "user", "content": "hi"}]}) == "hi"
+
+
+def test_conversation_prompt_includes_prior_turns_and_tool_results():
+    prompt = conversation_prompt({
+        "messages": [
+            {"role": "system", "content": "你在 E:\\test-project 工作"},
+            {"role": "user", "content": "测试写入"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "我先写一个测试文件。"}],
+                "tool_calls": [{"function": {"name": "write_file", "arguments": "{\"path\":\"a.txt\"}"}}],
+            },
+            {"role": "tool", "name": "write_file", "content": "created=true"},
+            {"role": "user", "content": "继续"},
+        ]
+    })
+    assert "E:\\test-project" in prompt
+    assert "测试写入" in prompt
+    assert "write_file" in prompt
+    assert "created=true" in prompt
+    assert prompt.rstrip().endswith("继续")
 
 
 def test_extract_assistant_text_from_task():
@@ -341,6 +421,70 @@ def test_fetch_quota_retries_auth_failure_and_reads_packs(monkeypatch):
     assert snapshot.unsupported is False
 
 
+def test_exchange_401_says_relogin(isolated_db, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from providers.traework import token
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+    public_pem = key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("ascii")
+    account_id = db.add_account(
+        {
+            "name": "tw",
+            "uid": "tw-1",
+            "provider": "traework",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at": 9_999_999_999_999,
+            "extra": {
+                "host": "https://api.trae.cn",
+                "device_id": "device",
+                "machine_id": "machine",
+                "public_key_pem": public_pem,
+                "private_key_pem": private_pem,
+            },
+        }
+    )
+
+    class FakeResponse:
+        status_code = 401
+
+        def json(self):
+            return {"ResponseMetadata": {"Error": {"Code": "20101", "Message": "refresh token is invalid."}}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            assert json["RefreshToken"] == "old-refresh"
+            assert "x-cloudide-token" in headers
+            return FakeResponse()
+
+    monkeypatch.setattr(token.httpx, "AsyncClient", FakeClient)
+    with pytest.raises(token.TraeWorkAuthError) as caught:
+        asyncio.run(token.refresh_account(db.get_account(account_id)))
+    assert "HTTP 401" in str(caught.value)
+    assert "重新登录" in str(caught.value)
+    saved = db.get_account(account_id)
+    assert saved["refresh_token"] == "old-refresh"
+
+
 def test_auth_failure_after_refresh_says_login_expired(monkeypatch):
     from providers.traework import quota
 
@@ -406,6 +550,137 @@ def test_traework_auth_dirs_ignore_workbuddy_cb_auth_dir(monkeypatch, tmp_path):
 def test_decrypt_tc_roundtrip_rejects_garbage():
     with pytest.raises(Exception):
         decrypt_tc_b64("not-base64-$$$")
+
+
+def test_encrypt_tc_roundtrip():
+    plain = json.dumps({"token": "access", "refreshToken": "refresh", "userId": "u1"}, separators=(",", ":"))
+    assert decrypt_tc_b64(encrypt_tc_b64(plain)) == plain
+
+
+def _storage_file(folder: Path, document: dict) -> Path:
+    path = folder / "storage.json"
+    blob = encrypt_tc_b64(json.dumps(document, separators=(",", ":")))
+    path.write_text(
+        json.dumps({"telemetry.machineId": "m1", "iCubeAuthInfo://icube.cloudide": blob}, indent=4),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_refresh_writes_storage_so_reimport_keeps_new_token(isolated_db, monkeypatch, tmp_path):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from providers.traework import token
+    from providers.traework.store import import_discovered
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+    folder = tmp_path / "trae-auth"
+    folder.mkdir()
+    monkeypatch.setenv("CB_TRAEWORK_AUTH_DIR", str(folder))
+    auth_path = _storage_file(
+        folder,
+        {
+            "token": "old-access",
+            "refreshToken": "old-refresh",
+            "userId": "tw-write",
+            "expiredAt": "2026-10-01T00:00:00.000Z",
+            "host": "https://api.trae.cn",
+            "account": {"username": "kept"},
+        },
+    )
+    account_id = db.add_account(
+        {
+            "name": "tw",
+            "uid": "tw-write",
+            "provider": "traework",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at": 1_700_000_000_000,
+            "extra": {
+                "host": "https://api.trae.cn",
+                "device_id": "device",
+                "private_key_pem": private_pem,
+                "auth_path": str(auth_path),
+            },
+        }
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "Result": {
+                    "Token": "new-access",
+                    "RefreshToken": "new-refresh",
+                    "TokenExpireAt": "2026-10-20T12:13:58.000Z",
+                    "RefreshExpireAt": "2027-04-04T12:13:58.000Z",
+                }
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(token.httpx, "AsyncClient", FakeClient)
+    fresh = asyncio.run(token.refresh_account(db.get_account(account_id)))
+    assert fresh["access_token"] == "new-access"
+    assert fresh["refresh_token"] == "new-refresh"
+    reimported = import_discovered(str(auth_path))
+    assert reimported["access_token"] == "new-access"
+    assert reimported["refresh_token"] == "new-refresh"
+    assert reimported["nickname"] == "kept"
+    backup = auth_path.with_name("storage.json.buddy2api.bak")
+    assert backup.is_file()
+    assert "old-refresh" in decrypt_tc_b64(json.loads(backup.read_text(encoding="utf-8"))["iCubeAuthInfo://icube.cloudide"])
+
+
+def test_refresh_does_not_write_outside_auth_dir(monkeypatch, tmp_path):
+    from providers.traework.store import write_refreshed_session
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("CB_TRAEWORK_AUTH_DIR", str(allowed))
+    target = _storage_file(outside, {"token": "old", "refreshToken": "old", "userId": "u"})
+    before = target.read_text(encoding="utf-8")
+    write_refreshed_session(
+        {"uid": "u", "extra": {"auth_path": str(target)}},
+        {"access_token": "new", "refresh_token": "new", "expires_at": 1_800_000_000_000},
+    )
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_refresh_skips_mismatched_uid(monkeypatch, tmp_path):
+    from providers.traework.store import write_refreshed_session
+
+    folder = tmp_path / "trae-auth"
+    folder.mkdir()
+    monkeypatch.setenv("CB_TRAEWORK_AUTH_DIR", str(folder))
+    target = _storage_file(folder, {"token": "old", "refreshToken": "old", "userId": "owner"})
+    write_refreshed_session(
+        {"uid": "other", "extra": {"auth_path": str(target)}},
+        {"access_token": "new", "refresh_token": "new", "expires_at": 1_800_000_000_000},
+    )
+    document = json.loads(decrypt_tc_b64(json.loads(target.read_text(encoding="utf-8"))["iCubeAuthInfo://icube.cloudide"]))
+    assert document["token"] == "old"
+    assert document["refreshToken"] == "old"
 
 
 def test_stream_once_yields_bytes():
