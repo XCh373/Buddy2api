@@ -2,9 +2,9 @@
 
 [English](README_EN.md) | [中文](README.md)
 
-> Local consumer AI clients → one OpenAI-compatible API for Codex, OpenCode, Cherry Studio, NextChat, and similar agents. Work Buddy / CodeBuddy, QClaw, QwenWork, and TraeWork are on by default; pick one in the UI dropdown. Each request stays on one channel.
+> Local consumer AI clients → one OpenAI-compatible API for Codex, OpenCode, Cherry Studio, NextChat, and similar agents. Work Buddy / CodeBuddy, Qoder, QwenWork, TraeWork, iFlytek Loomy, and SenseTime Xiaohuanxiong are on by default; pick one in the UI dropdown. Each request stays on one channel. QClaw is retired; its credits moved to WorkBuddy.
 
-Release **2.1.18**. Local use only, and only with accounts you personally own. Do not expose this on the public internet, and do not share credentials, API keys, or the database.
+Release **2.2.5**. Default channels include WorkBuddy domestic and international, Qoder CN and international, QwenWork, TraeWork, Loomy, and Xiaohuanxiong. Channels without a stored login are omitted from the model list. Local use only, and only with accounts you personally own. Do not expose this on the public internet, and do not share credentials, API keys, or the database.
 
 **Your own accounts only. Do not use SMS-code platforms, bulk registration, or any batch method to farm credits.** Do not expose the gateway to other people, claim rewards for them, or resell quota.
 
@@ -12,9 +12,13 @@ Default loopback startup opens the management page without an Admin Token. Resta
 
 ## What is this?
 
-Buddy2api listens on `http://127.0.0.1:8787/v1`. You stay signed into the official apps; this gateway imports those sessions and forwards chat. Typical clients use Chat Completions. Codex uses `/v1/responses`; create the key as type Codex in the UI to enable Codex prompt sanitization.
+Buddy2api listens on `http://127.0.0.1:8787/v1`. You stay signed into the official apps; this gateway imports those sessions and forwards chat. Typical clients use Chat Completions. Codex uses `/v1/responses`. A key can stay on one channel, or use automatic channel and pick the vendor with a `channel/model` id.
 
-All four channels are on by default. A channel with no local login shows empty on Accounts; nothing is imported until you click Import.
+Five channels are on by default. A channel with no local login shows empty on Accounts; nothing is imported until you click Import. `qclaw` in `CB_GATEWAY_PROVIDERS` is ignored.
+
+Qoder CN reads `%APPDATA%\com.qodercn.app.stable\auth.v1.dat`. Qoder international reads `%APPDATA%\com.qoder.app.stable\auth.v1.dat`. Their login files, model catalogs, and tokens are not interchangeable. Quota is shown from claim results and the official balance. Tool calls are returned to the local client.
+
+Loomy reads a local `auth-session.json`. Its daily balance is granted upstream; one-click claim only reads that balance. Long Loomy chats are trimmed to a 160k-token budget before send. Xiaohuanxiong reads a local `auth.json`, and one-click claim triggers the daily grant. Neither channel uses the WorkBuddy CLI header set.
 
 ```powershell
 python server.py
@@ -22,19 +26,23 @@ python server.py
 
 | Channel | Default | Where logins live |
 |---|---|---|
-| WorkBuddy / CodeBuddy | on | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth` |
-| QClaw | on | `%APPDATA%\QClaw` |
+| WorkBuddy / CodeBuddy domestic | on | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth` |
+| WorkBuddy international | on | Same folder; `*.workbuddy.ai` accounts move to `workbuddy-i` |
+| Qoder CN | on | `%APPDATA%\com.qodercn.app.stable\auth.v1.dat` |
+| Qoder international | on | `%APPDATA%\com.qoder.app.stable\auth.v1.dat` |
 | QwenWork | on | `%APPDATA%\QwenWorkCN` |
 | TraeWork | on | `%APPDATA%\TRAE SOLO CN\User\globalStorage` |
+| iFlytek Loomy | on | `%PUBLIC%\Loomy\*\userData\auth-session.json` |
+| SenseTime Xiaohuanxiong | on | `%USERPROFILE%\.box-agent\config\auth.json` |
 
 Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 
 ## Before you start
 
-1. **An empty Accounts page after startup is expected.** 2.0 does not import on boot. For WorkBuddy, use **Browser login** and sign in on the official page. You can also pick a channel → Detect → Import. **Keep alive** refreshes saved logins and claims today's points. Scheduled keepalive and check-in live in Settings and stay off until you turn them on and save.
-2. **One API key is one channel.** Create the key with a channel selected. A WorkBuddy key uses `auto` / `glm-5.2`; a QwenWork key uses `auto` or `qwork-advanced`; a TraeWork key uses `auto` or `qwen-3.7-plus`. Mismatched model/key returns 400 or 403 — there is no cross-vendor failover.
+1. **An empty Accounts page after startup is expected.** 2.0 does not import on boot. For WorkBuddy, use **Browser login** and sign in on the official page. You can also pick a channel → Detect → Import. **Renew and claim** refreshes saved logins and claims today's points. A single account can use **Renew** in its row menu. Scheduled renewal and check-in live in Settings and stay off until you turn them on and save.
+2. **One API key is one channel.** Create the key with a channel selected. A WorkBuddy key uses `auto` / `glm-5.2`; a Qoder key uses `auto` or `Qwen3.8-Flash`; a QwenWork key uses `auto` or `qwork-advanced`; a TraeWork key uses `auto` or `qwen-3.7-plus`. Mismatched model/key returns 400 or 403 — there is no cross-vendor failover. Automatic channel uses a prefixed id such as `qoder/DeepSeek-Flash` for that hop.
 3. **HTTP 503 `channel_unavailable`** means that channel has no imported account.
-4. **Run QClaw / QwenWork with `python server.py` on Windows.** A Linux Docker container cannot decrypt those DPAPI files; the UI says so. WorkBuddy can stay on Docker.
+4. **Run QwenWork with `python server.py` on Windows.** A Linux Docker container cannot decrypt its DPAPI files; the UI says so. WorkBuddy can stay on Docker.
 5. If the chat client is itself in Docker, Base URL is `http://host.docker.internal:8787/v1`.
 
 WorkBuddy 5.6+ encrypts sensitive fields in `.info` login snapshots. Detection and manual import try to decrypt them with the locally installed WorkBuddy app; a snapshot is marked invalid or skipped if the local key cannot be read. The detection list groups snapshots by channel and UID, showing the newest by default while keeping older snapshots expandable.
@@ -58,7 +66,7 @@ python server.py
 
 3. Open http://127.0.0.1:8787 → Accounts → Detect → Import → Test → API Keys (select a channel; pick Codex if the client is Codex) → point your client at `http://127.0.0.1:8787/v1`.
 
-Windows script: `.\start.bat`. Docker helper: `.\start-docker-win.ps1` (WorkBuddy mount; use native Python for QClaw/QwenWork).
+Windows script: `.\start.bat`. Docker helper: `.\start-docker-win.ps1` (WorkBuddy mount; use native Python for QwenWork).
 
 Later starts: `conda activate buddy2api` then `python server.py` in the project directory.
 
@@ -86,7 +94,7 @@ The database migrates on startup. Existing keys stay on `workbuddy`. Startup no 
 |---|---|
 | Base URL | `http://127.0.0.1:8787/v1` |
 | API Key | Created in the UI, bound to one channel |
-| Model | WorkBuddy `auto`; QClaw `auto`; QwenWork `qwork-advanced` |
+| Model | WorkBuddy, Loomy, and Xiaohuanxiong use `auto`; Qoder uses `auto` or `Qwen3.8-Flash`; QwenWork uses `auto` or `qwork-advanced`; TraeWork uses `auto` or `qwen-3.7-plus`. Move old QClaw keys to WorkBuddy |
 
 Unprefixed `auto` follows the key’s channel. Use a separate key per channel. On the Models page, “一键读取供应模型” refreshes each channel’s supplier list separately; a TraeWork-only id such as Doubao is never merged into WorkBuddy.
 
@@ -98,14 +106,13 @@ Missing fields independently fall back to 262,144 context tokens and 32,768 outp
 
 ### Reasoning effort
 
-WorkBuddy's collected responses, including the default tool-stall retry path, reject partial text without completion metadata instead of synthesizing a successful `stop`. An explicit `finish_reason` followed by EOF remains valid without `[DONE]`. A `[DONE]` event alone does not make text without a finish reason complete. This validation does not determine whether a model's explicit `stop` is premature or resolve every long-session stall.
+WorkBuddy's collected responses reject partial text without completion metadata instead of synthesizing a successful `stop`. An explicit `finish_reason` followed by EOF remains valid without `[DONE]`; a `[DONE]` event alone does not make text without a finish reason complete. A valid `stop` is returned as the model's completed answer even when tool results appear in the history. The gateway does not infer another tool call from the answer text, and the legacy `CB_GATEWAY_TOOL_STALL_RETRY` and `CB_GATEWAY_TOOL_STALL_FAIL_STREAM` variables no longer affect requests.
 
 Agent clients can send top-level `reasoning_effort` to Chat Completions and the standard `reasoning: {"effort": "high"}` object to Responses. Compatibility forms used by OpenCode, DSH, Cherry, and Claude-style clients are also accepted: `reasoning.effort`, `reasoningEffort`, `thinking.type`, `thinking.effort`, `output_config.effort`, and `enable_thinking`. Accepted levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; `off` is an alias for `none`.
 
 | Channel | Effective capability |
 |---|---|
 | WorkBuddy | DeepSeek V4 Pro/Flash supports `low` / `high` / `max`; standard levels are projected onto those tiers. The default is `high` and can be disabled with `CB_GATEWAY_DEFAULT_REASONING_EFFORT=off` |
-| QClaw | The control is normalized to `reasoning_effort` and forwarded. Whether a tier takes effect depends on the selected upstream model; no gateway default is injected |
 | QwenWork | The protocol exposes only an `is_reasoning` switch. `none` disables it and any other explicit tier enables it; distinct effort levels are unavailable |
 | TraeWork | The current session protocol has no verified reasoning control field, so effort selection is not supported |
 
@@ -128,7 +135,7 @@ The upstream owns deduction within an account. Local consumption estimates do no
 
 ## Environment
 
-`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
+`CB_GATEWAY_PROVIDERS` (default `workbuddy,workbuddy-i,qwenwork,qoder,qoder-i,traework,loomy,xiaohuanxiong`; `qclaw` is ignored), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_AUTH_DIR` / `CB_QODER_USER_DATA_DIR` / `CB_QODER_I_USER_DATA_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR` / `CB_LOOMY_AUTH_DIR` / `CB_XHX_AUTH_DIR`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
 
 `CB_GATEWAY_DEFAULT_REASONING_EFFORT` controls the default reasoning effort for WorkBuddy DeepSeek V4 Pro/Flash. It accepts `low`, `high`, or `max`, defaults to `high`, and can be disabled with `off`. A Responses `reasoning.effort` or Chat Completions `reasoning_effort` value overrides the default.
 

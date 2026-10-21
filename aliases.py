@@ -18,7 +18,7 @@ class AliasError(ValueError):
 
 
 def _builtin_aliases(channel: str) -> dict[str, str]:
-    if channel == "workbuddy":
+    if channel in {"workbuddy", "workbuddy-i"}:
         import proxy
 
         return dict(proxy._BUILTIN_ALIASES)
@@ -30,8 +30,18 @@ def _builtin_aliases(channel: str) -> dict[str, str]:
         from providers.qwenwork.constants import ALIASES
 
         return dict(ALIASES)
+    if channel in {"qoder", "qoder-i"}:
+        return {"auto": "Qwen3.8-Flash"}
     if channel == "traework":
         from providers.traework.constants import ALIASES
+
+        return dict(ALIASES)
+    if channel == "loomy":
+        from providers.loomy.constants import ALIASES
+
+        return dict(ALIASES)
+    if channel == "xiaohuanxiong":
+        from providers.xiaohuanxiong.constants import ALIASES
 
         return dict(ALIASES)
     return {}

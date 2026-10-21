@@ -9,7 +9,7 @@ import httpx
 import auth_manager
 import database as db
 from providers.protocol import ChannelId, QuotaSnapshot
-from providers.qwenwork import chat, store
+from providers.qwenwork import chat, checkin, store
 from providers.qwenwork.constants import (
     ACCOUNT_CONTEXT_PATH,
     CHANNEL_ID,
@@ -23,7 +23,7 @@ from providers.qwenwork.token import QwenWorkAuthError, is_token_expired, openap
 class QwenWorkProvider:
     id: ChannelId = CHANNEL_ID
     display_name = DISPLAY_NAME
-    checkin_supported = False
+    checkin_supported = True
 
     def list_models(self) -> list[dict]:
         import catalog
@@ -90,6 +90,12 @@ class QwenWorkProvider:
 
     def upsert_account(self, parsed: dict) -> dict:
         return store.upsert_account(parsed)
+
+    async def fetch_checkin(self, account: dict, force: bool = False) -> dict:
+        return await checkin.fetch_checkin(account, force=force)
+
+    async def claim_checkin(self, account: dict) -> dict:
+        return await checkin.claim_checkin(account)
 
     async def fetch_quota(self, account: dict) -> QuotaSnapshot:
         account_id = int(account.get("id") or 0)

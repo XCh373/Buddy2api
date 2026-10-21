@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from providers.traework.constants import (
     STORAGE_FILENAME,
     UG_API,
 )
-from providers.traework.crypto import decrypt_tc_b64
+from providers.traework.crypto import decrypt_tc_b64, encrypt_tc_b64
 
 
 def traework_user_data_dir() -> Path:
@@ -41,6 +42,11 @@ def traework_auth_dirs() -> list[Path]:
             seen.add(key)
             out.append(item)
     return out
+
+
+def ms_to_iso(value: int) -> str:
+    moment = datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
 def iso_to_ms(value) -> int:
@@ -286,3 +292,55 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _allowed_auth_file(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if resolved.name != STORAGE_FILENAME:
+        return False
+    return any(_is_relative_to(resolved, folder.resolve()) for folder in traework_auth_dirs())
+
+
+def write_refreshed_auth(path: Path, patch: dict, expected_uid: str = "") -> None:
+    """Write rotated tokens back so the next import does not restore a revoked refresh token."""
+    if not path.is_file() or not _allowed_auth_file(path):
+        return
+    storage = _read_storage(path)
+    blob = storage.get(AUTH_STORAGE_KEY)
+    if not isinstance(blob, str) or not blob:
+        raise CredentialCryptoError("TraeWork storage.json has no iCubeAuthInfo")
+    document = json.loads(decrypt_tc_b64(blob))
+    if not isinstance(document, dict):
+        raise CredentialCryptoError("TraeWork auth JSON is not an object")
+    file_uid = str(document.get("userId") or "")
+    if expected_uid and file_uid and file_uid != expected_uid:
+        return
+    if patch.get("access_token"):
+        document["token"] = patch["access_token"]
+    if patch.get("refresh_token"):
+        document["refreshToken"] = patch["refresh_token"]
+    if patch.get("expires_at"):
+        document["expiredAt"] = ms_to_iso(int(patch["expires_at"]))
+    if patch.get("refresh_expires_at"):
+        document["refreshExpiredAt"] = ms_to_iso(int(patch["refresh_expires_at"]))
+    document["tokenReleaseAt"] = ms_to_iso(int(time.time() * 1000))
+    storage[AUTH_STORAGE_KEY] = encrypt_tc_b64(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    )
+    backup = path.with_name(path.name + ".buddy2api.bak")
+    if not backup.exists():
+        backup.write_bytes(path.read_bytes())
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(storage, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_refreshed_session(account: dict, patch: dict) -> None:
+    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+    raw = str(extra.get("auth_path") or "").strip()
+    if not raw:
+        return
+    write_refreshed_auth(Path(raw), patch, expected_uid=str(account.get("uid") or ""))

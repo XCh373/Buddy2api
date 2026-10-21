@@ -56,7 +56,7 @@ CB_GATEWAY_AUTO_IMPORT=0 \
 | `database.py:get_account_resource_cache` | 依据持久化更新时间计算 cache age；不能把取出缓存的时间当成成功查询时间 |
 | `database.py:add_log`、`account_increment_usage` | 本地有累计 `total_credits`，但没有实际逐包扣费记录 |
 | `providers/workbuddy/__init__.py`、其他 provider facade | 多个通道复用 `auth_manager.pick_account`，必须显式限制新增策略只用于 WorkBuddy |
-| `proxy.py:_json_chat_with_stall_retry`、`_stream_upstream` | 每次重试传入 `tried_ids`；串流输出前可以切换账号，既有重试与计费边界需保留 |
+| `proxy.py:_json_chat_with_retries`、`_stream_upstream` | 账号故障重试传入 `tried_ids`；串流输出前可以切换账号，既有重试与计费边界需保留。模型返回合法 `stop` 时不根据文本推断后续工具调用 |
 | `server.py:admin_update_settings` | settings 表现成可用，但管理写入接口只接受 `backend_url/default_domain/timeout`，需增加校验后的策略字段 |
 | `web/index.html` 的 Settings 与账号排序 | “最近到期优先”目前只影响显示顺序；保存设置目前未包含路由策略 |
 

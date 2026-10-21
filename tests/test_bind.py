@@ -100,6 +100,48 @@ def test_bare_qwork_advanced_on_workbuddy_key_rejected():
         router.bind({"model": "qwork-advanced"}, {"default_channel": "workbuddy"})
 
 
+def test_any_channel_prefix_selects_that_channel(qwen_enabled):
+    bound = router.bind(
+        {"model": "qwenwork/qwork-advanced"},
+        {"default_channel": "*"},
+    )
+    assert bound.channel == "qwenwork"
+    assert bound.inner == "qwork-advanced"
+
+
+def test_any_channel_auto_uses_first_channel_with_an_account(qwen_enabled, monkeypatch):
+    monkeypatch.setattr(router.db, "get_active_accounts", lambda channel: [{"id": 1}] if channel == "qwenwork" else [])
+    bound = router.bind({"model": "auto"}, {"default_channel": "*"})
+    assert bound.channel == "qwenwork"
+    assert bound.inner == "auto"
+
+
+def test_any_channel_auto_stays_on_first_active_account_even_if_later_channels_exist(qwen_enabled, monkeypatch):
+    monkeypatch.setattr(router.db, "get_active_accounts", lambda channel: [{"id": 1}] if channel == "workbuddy" else [])
+    bound = router.bind({"model": "auto"}, {"default_channel": "*"})
+    assert bound.channel == "workbuddy"
+
+
+def test_any_channel_bare_model_uses_the_channel_that_accepts_it(qwen_enabled, monkeypatch):
+    monkeypatch.setattr(router.db, "get_active_accounts", lambda channel: [{"id": 1}] if channel == "qwenwork" else [])
+    bound = router.bind({"model": "qwork-advanced"}, {"default_channel": "*"})
+    assert bound.channel == "qwenwork"
+    assert bound.inner == "qwork-advanced"
+
+
+def test_any_channel_unknown_bare_model_is_rejected(qwen_enabled):
+    with pytest.raises(UnknownModel):
+        router.bind({"model": "not-a-real-model"}, {"default_channel": "*"})
+
+
+def test_specific_key_still_rejects_another_channel_prefix(qwen_enabled):
+    with pytest.raises(KeyChannelMismatch):
+        router.bind(
+            {"model": "qwenwork/qwork-advanced"},
+            {"default_channel": "workbuddy"},
+        )
+
+
 def test_prefix_mismatch_is_403(qwen_enabled):
     with pytest.raises(KeyChannelMismatch):
         router.bind(

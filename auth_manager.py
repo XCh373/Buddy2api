@@ -620,8 +620,14 @@ async def refresh_token(account: dict) -> bool:
 def upsert_login_account(parsed: dict) -> dict:
     """Insert or update a WorkBuddy account from browser login. Keeps weight and priority."""
     uid = str(parsed.get("uid") or "").strip()
+    channel = workbuddy_channel_for_domain(str(parsed.get("domain") or ""))
+    parsed["provider"] = channel
     existing = next(
-        (row for row in db.list_accounts(provider="workbuddy") if row.get("uid") == uid),
+        (
+            row
+            for row in db.list_accounts(provider="workbuddy") + db.list_accounts(provider="workbuddy-i")
+            if row.get("uid") == uid
+        ),
         None,
     )
     if existing:
@@ -631,6 +637,7 @@ def upsert_login_account(parsed: dict) -> dict:
             "expires_at": parsed.get("expires_at") or existing.get("expires_at") or 0,
             "refresh_expires_at": parsed.get("refresh_expires_at") or existing.get("refresh_expires_at") or 0,
             "domain": parsed.get("domain") or existing.get("domain") or DEFAULT_DOMAIN,
+            "provider": channel,
             "status": "active",
         }
         if parsed.get("nickname"):
@@ -1223,8 +1230,18 @@ def _set_sticky_account(aid: int, provider: str = "workbuddy"):
         _sticky_account_id[provider] = aid
 
 
-def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> Optional[dict]:
-    """选择一个可用账号。优先级越高越先用，同优先级尽量粘住当前账号。"""
+def workbuddy_channel_for_domain(domain: str) -> str:
+    host = _host_from(domain)
+    if host == "workbuddy.ai" or host.endswith(".workbuddy.ai"):
+        return "workbuddy-i"
+    return "workbuddy"
+
+
+def pick_account(
+    exclude_ids: set[int] = None,
+    provider: str = "workbuddy",
+) -> Optional[dict]:
+    """Pick an available account. Higher priority first; stick to the current one on ties."""
     exclude_ids = exclude_ids or set()
     accounts = db.get_active_accounts(provider)
     candidates = [
@@ -1280,13 +1297,13 @@ def routing_preview() -> dict:
 
 
 async def pick_account_with_fallback(
-    exclude_ids: set[int] = None, provider: str = "workbuddy"
+    exclude_ids: set[int] = None,
+    provider: str = "workbuddy",
 ) -> Optional[dict]:
-    """选账号，如果全部过期则尝试刷新过期账号。只刷新同一 provider。"""
+    """Pick an account; refresh expired ones if needed. Only refreshes the same provider."""
     account = pick_account(exclude_ids, provider=provider)
     if account:
         return account
-
     expired_accounts = sorted(
         (
             account
@@ -1302,7 +1319,7 @@ async def pick_account_with_fallback(
             fresh = db.get_account(a["id"])
             if fresh:
                 _set_sticky_account(fresh["id"], provider)
-            return fresh
+                return fresh
     return None
 
 

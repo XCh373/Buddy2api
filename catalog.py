@@ -137,8 +137,8 @@ def current_models(channel: str) -> list[dict]:
     provider = providers.get_provider(channel)
     if provider is not None:
         return list(provider.list_models())
-    if channel == "workbuddy":
-        return workbuddy_fallback_models()
+    if channel in {"workbuddy", "workbuddy-i"}:
+        return workbuddy_fallback_models(channel)
     return extras_for(channel)
 
 
@@ -193,9 +193,11 @@ def remove_model(channel: str, model_id: str) -> dict:
     }
 
 
-def workbuddy_fallback_models() -> list[dict]:
+def workbuddy_fallback_models(channel: str = "workbuddy") -> list[dict]:
     import proxy
 
+    if channel != "workbuddy":
+        return list(proxy.DEFAULT_MODELS)
     try:
         models = db.get_setting("models", proxy.DEFAULT_MODELS)
     except sqlite3.OperationalError:
@@ -211,8 +213,8 @@ def _fallback_models(channel: str, provider) -> list[dict]:
             return list(provider.list_models())
         except Exception:
             pass
-    if channel == "workbuddy":
-        return workbuddy_fallback_models()
+    if channel in {"workbuddy", "workbuddy-i"}:
+        return workbuddy_fallback_models(channel)
     return extras_for(channel)
 
 
@@ -256,6 +258,12 @@ async def _fetch_traework(account: dict) -> list[dict]:
     return await fetch_supplier_models(account)
 
 
+async def _fetch_qoder(account: dict) -> list[dict]:
+    from providers.qoder.models import fetch_supplier_models
+
+    return await fetch_supplier_models(account)
+
+
 async def _fetch_qwenwork(account: dict) -> list[dict]:
     from providers.qwenwork.models import fetch_supplier_models
 
@@ -268,11 +276,28 @@ async def _fetch_workbuddy(account: dict) -> list[dict]:
     return await fetch_supplier_models(account)
 
 
+async def _fetch_loomy(account: dict) -> list[dict]:
+    from providers.loomy.models import fetch_supplier_models
+
+    return await fetch_supplier_models(account)
+
+
+async def _fetch_xiaohuanxiong(account: dict) -> list[dict]:
+    from providers.xiaohuanxiong.models import fetch_supplier_models
+
+    return await fetch_supplier_models(account)
+
+
 LIVE_FETCHERS: dict[str, Fetcher] = {
     "qclaw": _fetch_qclaw,
     "traework": _fetch_traework,
     "qwenwork": _fetch_qwenwork,
+    "qoder": _fetch_qoder,
+    "qoder-i": _fetch_qoder,
     "workbuddy": _fetch_workbuddy,
+    "workbuddy-i": _fetch_workbuddy,
+    "loomy": _fetch_loomy,
+    "xiaohuanxiong": _fetch_xiaohuanxiong,
 }
 
 
@@ -361,7 +386,7 @@ def catalog_snapshot() -> dict:
         if provider is not None:
             models = list(provider.list_models())
         elif channel == "workbuddy":
-            models = workbuddy_fallback_models()
+            models = workbuddy_fallback_models(channel)
         else:
             models = []
         meta = refresh.get(channel) if isinstance(refresh.get(channel), dict) else {}

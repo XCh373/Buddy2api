@@ -20,6 +20,7 @@ import httpx
 
 import database as db
 import auth_manager
+import workbuddy_outbound
 from reasoning_controls import (
     chat_reasoning_effort,
     resolve_reasoning_control,
@@ -66,78 +67,21 @@ def _looks_like_audit_block(text: str) -> bool:
     return any(all(phrase in text for phrase in group) for group in _AUDIT_PHRASE_GROUPS)
 
 
-# 工具停转（tool stall）检测与修复开关。
-# 场景：agent 工具循环回合（请求带 tools 且历史含 role=tool），上游模型却以
-# finish_reason=stop + 纯文本结束且未调用任何工具（issue #31 / #61）。
-TOOL_STALL_RETRY = (
-    os.environ.get("CB_GATEWAY_TOOL_STALL_RETRY", "1").strip().lower()
-    not in {"0", "false", "no", "off"}
-)
-TOOL_STALL_FAIL_STREAM = (
-    os.environ.get("CB_GATEWAY_TOOL_STALL_FAIL_STREAM", "0").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-
-_STALL_POSITIVE_MARKERS = (
-    "马上继续", "继续跑", "接下来需要", "请问您接下来",
-    "这就去", "马上开始", "我现在就", "这就开始", "稍等",
-    "好的继续",
-)
-_STALL_POSITIVE_MARKERS_EN = (
-    "i'll continue", "i will continue", "let me continue",
-    "continuing", "got it", "one moment", "hang on", "right away",
-)
-_STALL_NEGATIVE_MARKERS = (
-    "总结", "已完成", "结果如下", "以下是", "以上就是", "完成情况",
-)
-_STALL_NEGATIVE_MARKERS_EN = (
-    "in summary", "to summarize", "task complete", "already done",
-    "all done", "here's the result", "here is the result",
-)
-_STALL_SHORT_LIMIT = 400
-
-
-def _request_has_tool_loop(body: dict) -> bool:
-    """是否为 agent 工具循环回合：声明了 tools 且历史里存在工具结果。"""
-    if not isinstance(body.get("tools"), list) or not body["tools"]:
-        return False
-    return any(
-        isinstance(msg, dict) and msg.get("role") == "tool"
-        for msg in (body.get("messages") or [])
-    )
-
-
-def _looks_like_stall_text(text: str) -> bool:
-    """空内容或短的非总结回复视为 stall；长文本仍要像确认话术。"""
-    text = (text or "").strip()
-    if not text:
-        return True
-    collapsed = " ".join(text.split())
-    lower = collapsed.lower()
-    if any(marker in collapsed for marker in _STALL_NEGATIVE_MARKERS):
-        return False
-    if any(marker in lower for marker in _STALL_NEGATIVE_MARKERS_EN):
-        return False
-    if len(collapsed) <= _STALL_SHORT_LIMIT:
-        return True
-    return any(marker in collapsed for marker in _STALL_POSITIVE_MARKERS) or any(
-        marker in lower for marker in _STALL_POSITIVE_MARKERS_EN
-    )
-
-
-def _is_tool_stall(body: dict, finish_reason, tool_calls: bool, text: str) -> bool:
-    """判定一次上游完成是否属于工具停转（stall）。"""
-    if not _request_has_tool_loop(body):
-        return False
-    if tool_calls:
-        return False
-    if (finish_reason or "stop") not in {"stop", None}:
-        return False
-    return _looks_like_stall_text(text)
-
-
 def _is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUS_CODES or status in {401, 403}
+
+
+def _apply_account_rule(account_id: int, status: int, detail):
+    """Apply a Tencent envelope decision. None means the HTTP status path stays."""
+    ruled = workbuddy_outbound.account_rule(status, detail)
+    if ruled is None:
+        return None
+    action, client_status, client_detail, failure = ruled
+    if action == "expire":
+        auth_manager.mark_account_failure(account_id, 401)
+    elif action == "rotate":
+        auth_manager.mark_account_failure(account_id, 429)
+    return action, client_status, client_detail, failure
 
 
 def _format_httpx_error(exc: BaseException) -> str:
@@ -352,6 +296,7 @@ def build_backend_body(payload: dict) -> dict:
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
+    workbuddy_outbound.prepare(body)
     return body
 
 
@@ -806,61 +751,18 @@ def _log_request(api_key_info, account, model_name, stream,
         pass
 
 
-def _sse_from_chat_completion(result: dict) -> list[bytes]:
-    choice = (result.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    model = result.get("model") or "auto"
-    cid = result.get("id") or ("chatcmpl-" + os.urandom(12).hex())
-    created = result.get("created") or int(time.time())
-    finish = choice.get("finish_reason") or "stop"
-    delta: dict = {"role": "assistant"}
-    if message.get("content"):
-        delta["content"] = message["content"]
-    if message.get("reasoning_content"):
-        delta["reasoning_content"] = message["reasoning_content"]
-    tool_calls = message.get("tool_calls") or []
-    if tool_calls:
-        delta["tool_calls"] = [
-            {
-                "index": index,
-                "id": item.get("id"),
-                "type": item.get("type") or "function",
-                "function": item.get("function") or {},
-            }
-            for index, item in enumerate(tool_calls)
-            if isinstance(item, dict)
-        ]
-    chunks = [
-        {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-        },
-        {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-            "usage": result.get("usage") or {},
-        },
-    ]
-    return [_json_sse_event(item) for item in chunks] + [b"data: [DONE]\n\n"]
-
-
-async def _json_chat_with_stall_retry(
+async def _json_chat_with_retries(
     body: dict,
     api_key_info: Optional[dict],
     model_name: str,
+    provider: str = "workbuddy",
 ) -> tuple:
     tried_ids: set[int] = set()
     max_retries = 3
     last_error = None
 
     for attempt in range(max_retries):
-        account = await auth_manager.pick_account_with_fallback(tried_ids)
+        account = await auth_manager.pick_account_with_fallback(tried_ids, provider=provider)
         if not account:
             break
 
@@ -874,35 +776,33 @@ async def _json_chat_with_stall_retry(
         t0 = time.time()
         result = await _collect_stream(url, headers, body, account, api_key_info, model_name, t0)
         if result[0] == "json":
-            # 工具停转：stop+纯文本且未调用工具时，用 tool_choice=required 再打一次。
-            if TOOL_STALL_RETRY:
-                choice = (result[1].get("choices") or [{}])[0]
-                message = choice.get("message") or {}
-                if _is_tool_stall(
-                    body,
-                    choice.get("finish_reason"),
-                    bool(message.get("tool_calls")),
-                    message.get("content") or "",
-                ):
-                    retry_body = {**body, "tool_choice": "required"}
-                    retry_t0 = time.time()
-                    retry_result = await _collect_stream(
-                        url, headers, retry_body, account, api_key_info, model_name, retry_t0
-                    )
-                    if retry_result[0] == "json":
-                        retry_choice = (retry_result[1].get("choices") or [{}])[0]
-                        retry_message = retry_choice.get("message") or {}
-                        if retry_message.get("tool_calls"):
-                            auth_manager.mark_account_success(account["id"])
-                            return retry_result
             auth_manager.mark_account_success(account["id"])
             return result
 
         last_error = result
         err_status = result[1][0]
+        detail = result[1][1]
+        ruled = _apply_account_rule(account["id"], err_status, detail)
+        if ruled is not None:
+            action, client_status, client_detail, failure = ruled
+            last_error = ("error", (client_status, client_detail))
+            error_message = client_detail
+            if isinstance(client_detail, dict):
+                error_data = client_detail.get("error") if isinstance(client_detail.get("error"), dict) else client_detail
+                error_message = error_data.get("message", client_detail) if isinstance(error_data, dict) else client_detail
+            will_retry = action != "stop" and attempt < max_retries - 1
+            _log_request(
+                api_key_info, account, model_name, False,
+                0, 0, 0, 0, "retry" if will_retry else failure,
+                client_status, _failure_log_message(failure, str(error_message)), t0,
+                increment_usage=not will_retry,
+            )
+            if not will_retry:
+                return last_error
+            await _retry_delay(attempt)
+            continue
         auth_manager.mark_account_failure(account["id"], err_status)
         will_retry = _is_retryable_status(err_status) and attempt < max_retries - 1
-        detail = result[1][1]
         error_message = detail
         if isinstance(detail, dict):
             error_data = detail.get("error") if isinstance(detail.get("error"), dict) else detail
@@ -924,28 +824,11 @@ async def _json_chat_with_stall_retry(
     )
 
 
-async def _stream_collected_with_stall_retry(
-    body: dict,
-    api_key_info: Optional[dict],
-    model_name: str,
-) -> AsyncGenerator[bytes, None]:
-    result = await _json_chat_with_stall_retry(body, api_key_info, model_name)
-    if result[0] == "error":
-        status, detail = result[1]
-        if isinstance(detail, dict):
-            yield _json_sse_event(detail)
-            yield b"data: [DONE]\n\n"
-        else:
-            yield _err_sse_event(str(detail).encode("utf-8"), status)
-        return
-    for chunk in _sse_from_chat_completion(result[1]):
-        yield chunk
-
-
 async def proxy_chat_completions(
     payload: dict,
     api_key_info: Optional[dict] = None,
     log_model: Optional[str] = None,
+    provider: str = "workbuddy",
 ) -> tuple:
     """
     主代理函数。
@@ -962,17 +845,12 @@ async def proxy_chat_completions(
     model_name = log_model if log_model is not None else payload.get("model", "auto")
 
     if client_wants_stream:
-        if TOOL_STALL_RETRY and _request_has_tool_loop(body):
-            return (
-                "stream",
-                _stream_collected_with_stall_retry(body, api_key_info, model_name),
-            )
         return (
             "stream",
-            _stream_upstream(body, api_key_info, model_name),
+            _stream_upstream(body, api_key_info, model_name, provider),
         )
 
-    return await _json_chat_with_stall_retry(body, api_key_info, model_name)
+    return await _json_chat_with_retries(body, api_key_info, model_name, provider)
 
 
 async def test_account_chat(account: dict, model: str = "auto", prompt: str = "ping") -> dict:
@@ -1026,6 +904,7 @@ async def _stream_upstream(
     body: dict,
     api_key_info: Optional[dict],
     model_name: str,
+    provider: str = "workbuddy",
 ) -> AsyncGenerator[bytes, None]:
     """Stream upstream SSE with pre-output account failover and backoff."""
     tried_ids: set[int] = set()
@@ -1038,7 +917,7 @@ async def _stream_upstream(
     pending_retry_log: dict | None = None
 
     for attempt in range(3):
-        account = await auth_manager.pick_account_with_fallback(tried_ids)
+        account = await auth_manager.pick_account_with_fallback(tried_ids, provider=provider)
         if not account:
             break
         if pending_retry_log is not None:
@@ -1091,6 +970,44 @@ async def _stream_upstream(
                     if response.status_code != 200:
                         raw_error = await response.aread()
                         failure, http_msg = _classify_http_status(response.status_code, raw_error)
+                        parsed = _safe_err(raw_error, response.status_code)
+                        ruled = _apply_account_rule(account["id"], response.status_code, parsed)
+                        if ruled is not None:
+                            action, client_status, client_detail, ruled_failure = ruled
+                            message = http_msg
+                            if isinstance(client_detail, dict):
+                                error_data = client_detail.get("error") if isinstance(client_detail.get("error"), dict) else client_detail
+                                if isinstance(error_data, dict) and error_data.get("message"):
+                                    message = str(error_data["message"])
+                            last_error = message.encode("utf-8")
+                            last_error_event = client_detail if isinstance(client_detail, dict) else None
+                            last_status = client_status
+                            last_failure = ruled_failure
+                            if action == "stop" or attempt >= 2:
+                                _log_request(
+                                    api_key_info, account, model_name, True,
+                                    0, 0, 0, 0, ruled_failure, client_status,
+                                    _failure_log_message(ruled_failure, message), t0,
+                                )
+                                if last_error_event is not None:
+                                    yield _json_sse_event(last_error_event)
+                                    yield b"data: [DONE]\n\n"
+                                else:
+                                    yield _err_sse_event(last_error, client_status, ruled_failure)
+                                return
+                            pending_retry_log = {
+                                "account": account,
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0,
+                                "credit": 0,
+                                "status": client_status,
+                                "failure": ruled_failure,
+                                "message": _failure_log_message(ruled_failure, message),
+                                "started": t0,
+                                "attempt": attempt,
+                            }
+                            continue
                         last_error = http_msg.encode("utf-8")
                         last_error_event = None
                         last_status = response.status_code
@@ -1249,11 +1166,9 @@ async def _stream_upstream(
         full_text = "".join(observer.content_parts)
         audit_blocked = _looks_like_audit_block(full_text)
         finish_reason = next((reason for reason in observer.finish_reasons.values() if reason), None)
-        tool_stall = _is_tool_stall(body, finish_reason, bool(observer.tool_call_choices), full_text)
-        log_finish = "content_filter" if audit_blocked else ("tool_stall" if tool_stall else (finish_reason or "stop"))
+        log_finish = "content_filter" if audit_blocked else (finish_reason or "stop")
         log_error = (
             ("[audit blocked] " + full_text[:300]) if audit_blocked
-            else ("[tool stall] " + full_text[:300]) if tool_stall
             else ""
         )
         _log_request(
@@ -1264,18 +1179,6 @@ async def _stream_upstream(
             observer.usage.get("credit", 0),
             log_finish, 200, log_error, t0,
         )
-        if tool_stall and TOOL_STALL_FAIL_STREAM:
-            # 流式已发出文本增量，无法回退重试；把本回合标记为失败，
-            # 让有重试机制的客户端（DSH / OpenCode 等）自动重试。
-            yield _json_sse_event({
-                "error": {
-                    "message": "The model finished a tool turn without calling a tool.",
-                    "type": "upstream_error",
-                    "code": "upstream_tool_stall",
-                },
-            })
-            yield b"data: [DONE]\n\n"
-            return
         for event in pending_terminal_events:
             yield event
         if synthetic_terminal is not None:

@@ -8,7 +8,7 @@ import credential_crypto
 import database as db
 import providers
 import router
-from providers.protocol import KeyChannelMismatch, UnknownChannel, UnknownModel
+from providers.protocol import UnknownChannel
 from providers.qclaw.constants import JPRX_SIGNATURE_KEY, STATIC_MODELS
 from providers.qclaw.chat import _build_body, fill_empty_content
 from providers.qclaw.sign import aizone_headers, jprx_ctx
@@ -24,13 +24,6 @@ def isolated_db(tmp_path, monkeypatch):
     db.init_db()
     yield path
     credential_crypto.reset_cache()
-
-
-@pytest.fixture()
-def qclaw_enabled(monkeypatch):
-    monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy,qclaw")
-    yield
-    monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
 
 
 def test_parse_today_tokens_used_and_limit():
@@ -50,12 +43,14 @@ def test_parse_today_tokens_used_and_limit():
     assert used is None and limit is None and remaining is None
 
 
-def test_qclaw_quota_uses_token_unit(qclaw_enabled, monkeypatch):
+def test_qclaw_quota_uses_token_unit(monkeypatch):
     async def fake_today_tokens(account):
         return {"used": 20, "limit": 80}
 
     monkeypatch.setattr("providers.qclaw.quota.today_tokens", fake_today_tokens)
-    snapshot = asyncio.run(providers.get_provider("qclaw").fetch_quota({"id": 1}))
+    from providers.qclaw import PROVIDER
+
+    snapshot = asyncio.run(PROVIDER.fetch_quota({"id": 1}))
     assert snapshot.unit == "token"
     assert snapshot.remaining == 60
     assert snapshot.unsupported is False
@@ -63,11 +58,13 @@ def test_qclaw_quota_uses_token_unit(qclaw_enabled, monkeypatch):
     assert snapshot.extra["limit"] == 80
 
 
-def test_qclaw_in_default_registry(monkeypatch):
+def test_qclaw_is_retired_and_ignored(monkeypatch):
     monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
-    assert providers.enabled_provider_ids() == ["workbuddy", "qclaw", "qwenwork", "traework"]
-    assert providers.get_provider("qclaw") is not None
-    assert "qclaw" in providers._LOADED
+    assert "qclaw" not in providers.enabled_provider_ids()
+    assert providers.get_provider("qclaw") is None
+    monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy,qclaw,qwenwork")
+    assert providers.enabled_provider_ids() == ["workbuddy", "qwenwork"]
+    assert providers.ignored_retired_ids() == ["qclaw"]
 
 
 def test_fill_empty_content_uses_reasoning():
@@ -144,16 +141,12 @@ def test_parse_credentials_requires_key():
         parse_credentials({"provider": "qclaw", "uid": "1"})
 
 
-def test_bind_qclaw_when_enabled(qclaw_enabled):
-    bound = router.bind({"model": "auto"}, {"default_channel": "qclaw"})
-    assert bound.channel == "qclaw"
-    assert bound.inner == "auto"
-    bound = router.bind({"model": "qclaw/pool-glm-5.2"}, {"default_channel": "qclaw"})
-    assert bound.inner == "pool-glm-5.2"
-    with pytest.raises(UnknownModel):
-        router.bind({"model": "glm-5.2"}, {"default_channel": "qclaw"})
-    with pytest.raises(KeyChannelMismatch):
-        router.bind({"model": "workbuddy/auto"}, {"default_channel": "qclaw"})
+def test_bind_qclaw_is_retired_even_if_listed(monkeypatch):
+    monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy,qclaw")
+    with pytest.raises(UnknownChannel, match="retired"):
+        router.bind({"model": "auto"}, {"default_channel": "qclaw"})
+    with pytest.raises(UnknownChannel, match="retired"):
+        router.bind({"model": "qclaw/default"}, {"default_channel": "workbuddy"})
 
 
 def test_bind_qclaw_disabled_is_unknown_channel(monkeypatch):

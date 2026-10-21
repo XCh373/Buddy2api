@@ -210,23 +210,12 @@ class _Wasm:
 
     def _pass_str(self, text: str) -> tuple[int, int]:
         malloc = self.ex["__wbindgen_export2"]
-        realloc = self.ex["__wbindgen_export3"]
         data = text.encode("utf-8")
-        ascii_ok = all(b < 128 for b in data)
-        if ascii_ok:
-            ptr = malloc(self.store, len(data), 1)
-            self.memory.write(self.store, data, ptr)
-            return ptr, len(data)
         ptr = malloc(self.store, len(data), 1)
-        written = 0
-        for byte in data:
-            if byte > 127:
-                break
-            written += 1
-        if written:
-            self.memory.write(self.store, data[:written], ptr)
-        ptr = realloc(self.store, ptr, len(data), written + 3 * (len(text) - written), 1)
-        self.memory.write(self.store, data, ptr)
+        if data and not ptr:
+            raise EncodeError("encoder could not allocate the request string")
+        if data:
+            self.memory.write(self.store, data, ptr)
         return ptr, len(data)
 
     def _stack_i32(self, retptr: int, offset: int) -> int:
@@ -347,6 +336,11 @@ def _runtime_get() -> _Wasm:
         return _runtime
 
 
+def _drop_runtime_locked() -> None:
+    global _runtime
+    _runtime = None
+
+
 def prepare_infer(
     *,
     body: str,
@@ -387,5 +381,13 @@ def prepare_infer(
         ctx = wasm.context_new(machine_id or "buddy2api", COSY_VERSION, user_info, brand)
         try:
             return wasm.prepare_infer(ctx, endpoint, body, model_key, source)
+        except Exception as exc:
+            _drop_runtime_locked()
+            if isinstance(exc, EncodeError):
+                raise
+            raise EncodeError(str(exc)[:240]) from exc
         finally:
-            wasm.context_free(ctx)
+            try:
+                wasm.context_free(ctx)
+            except Exception:
+                _drop_runtime_locked()

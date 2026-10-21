@@ -372,7 +372,8 @@ def test_settings_save_keepalive(isolated_db, monkeypatch):
 
 def test_account_page_has_keepalive_and_login_controls():
     text = Path("web/index.html").read_text(encoding="utf-8")
-    assert "一键保活" in text
+    assert "一键续期并领取" in text
+    assert "定时续期" in text
     assert "浏览器登录" in text
     assert "/admin/accounts/keepalive-all" in text
     assert "/admin/workbuddy/login/start" in text
