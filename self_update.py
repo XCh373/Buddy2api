@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import json
 import os
 import re
 import subprocess
@@ -26,6 +29,10 @@ VERSION_SOURCES = (
     ("github-raw", "https://raw.githubusercontent.com/{repo}/main/version.py", "file"),
     ("github-release", "https://api.github.com/repos/{repo}/releases/latest", "release"),
 )
+AUTHORITATIVE_VERSION_SOURCES = (
+    ("github-api", "https://api.github.com/repos/{repo}/contents/version.py?ref=main", "github-content"),
+    ("github-raw-main", "https://raw.githubusercontent.com/{repo}/main/version.py", "file"),
+)
 
 _cache: dict = {"at": 0.0, "ttl": 0.0, "payload": None}
 
@@ -46,9 +53,24 @@ def parse_version_file(text: str) -> str | None:
     return _normalize_version(match.group(1))
 
 
-def parse_release_tag(text: str) -> str | None:
-    import json
+def parse_github_content_version(text: str) -> str | None:
+    try:
+        payload = json.loads(text or "")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or str(payload.get("encoding") or "").lower() != "base64":
+        return None
+    content = payload.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    try:
+        decoded = base64.b64decode(re.sub(r"\s+", "", content), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    return parse_version_file(decoded)
 
+
+def parse_release_tag(text: str) -> str | None:
     try:
         data = json.loads(text)
     except (TypeError, ValueError):
@@ -130,14 +152,14 @@ async def check(*, force: bool = False) -> dict:
     payload = _cache.get("payload")
     if not force and payload and now - float(_cache.get("at") or 0) < float(_cache.get("ttl") or 0):
         return payload
-    payload = await _check_now()
+    payload = await _check_now(force=force)
     _cache["at"] = now
     _cache["ttl"] = CACHE_OK_TTL if payload.get("checked") else CACHE_FAIL_TTL
     _cache["payload"] = payload
     return payload
 
 
-async def _check_now() -> dict:
+async def _check_now(*, force: bool = False) -> dict:
     kind = install_kind()
     latest = None
     source = None
@@ -146,7 +168,7 @@ async def _check_now() -> dict:
         latest = forced
         source = "fake"
     else:
-        latest, source = await _fetch_latest()
+        latest, source = await _fetch_latest(force=force)
     current = VERSION
     checked = latest is not None
     update_available = bool(checked and is_newer(latest, current))
@@ -162,8 +184,11 @@ async def _check_now() -> dict:
     }
 
 
-async def _fetch_latest() -> tuple[str | None, str | None]:
-    for name, template, mode in VERSION_SOURCES:
+async def _fetch_latest(*, force: bool = False) -> tuple[str | None, str | None]:
+    # Automatic checks may use CDN mirrors for availability. A manual check or
+    # apply-time recheck must confirm the configured repository's main branch.
+    sources = AUTHORITATIVE_VERSION_SOURCES if force else VERSION_SOURCES
+    for name, template, mode in sources:
         url = template.format(repo=repo())
         try:
             status, text = await _get(url)
@@ -171,7 +196,12 @@ async def _fetch_latest() -> tuple[str | None, str | None]:
             continue
         if status != 200 or not text:
             continue
-        parsed = parse_version_file(text) if mode == "file" else parse_release_tag(text)
+        if mode == "github-content":
+            parsed = parse_github_content_version(text)
+        elif mode == "file":
+            parsed = parse_version_file(text)
+        else:
+            parsed = parse_release_tag(text)
         if not parsed:
             continue
         return parsed, name
