@@ -1,4 +1,4 @@
-"""TraeWork chat via remote chat_sessions. Isolated HTTP client."""
+"""TraeWork chat. Completions go through llm_utils_chat so tools return here."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from providers.traework.constants import (
     SESSIONS_PATH,
     STATIC_MODELS,
 )
+from providers.traework.llm_chat import TraeWorkChatError, _chunk as _llm_chunk, iter_llm_events
 from providers.traework.token import TraeWorkAuthError, auth_headers, is_token_expired, refresh_account
 
 
@@ -42,24 +43,78 @@ def accepts_model(inner: str) -> bool:
     return value in ids
 
 
-def _last_user_text(payload: dict) -> str:
-    for item in reversed(payload.get("messages") or []):
-        if not isinstance(item, dict) or item.get("role") != "user":
-            continue
-        content = item.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("text"):
-                    parts.append(str(part["text"]))
-                elif isinstance(part, str):
-                    parts.append(part)
-            text = "".join(parts).strip()
-            if text:
-                return text
+def _part_text(part) -> str:
+    if isinstance(part, str):
+        return part
+    if not isinstance(part, dict):
+        return ""
+    for key in ("text", "content", "output"):
+        value = part.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, list):
+            nested = "\n".join(_part_text(item) for item in value).strip()
+            if nested:
+                return nested
     return ""
+
+
+def _message_text(message: dict) -> str:
+    parts = []
+    content = message.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        parts.extend(_part_text(part) for part in content)
+    calls = message.get("tool_calls")
+    if isinstance(calls, list):
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "tool")
+            arguments = function.get("arguments") or ""
+            parts.append(f"[调用工具 {name}] {arguments}".strip())
+    return "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+
+
+def _role_label(message: dict) -> str:
+    role = str(message.get("role") or "user")
+    if role != "tool":
+        return role
+    name = str(message.get("name") or message.get("tool_call_id") or "tool")
+    return f"tool:{name}"
+
+
+def conversation_prompt(payload: dict) -> str:
+    """Turn the OpenAI message list into the one query TraeWork accepts.
+
+    Upstream stores history inside a chat session. This gateway opens a new
+    session per request, so the prior turns have to travel inside that query.
+    A lone user message stays unchanged.
+    """
+    rendered = []
+    for item in payload.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        text = _message_text(item)
+        if not text:
+            continue
+        rendered.append((_role_label(item), text))
+    if not any(role == "user" for role, _text in rendered):
+        return ""
+    if len(rendered) == 1 and rendered[0][0] == "user":
+        return rendered[0][1]
+    transcript = "\n\n".join(f"[{role}]\n{text}" for role, text in rendered)
+    return (
+        "下面是到目前为止的完整对话。请基于这些内容继续，只处理最新的用户请求。"
+        "如果最后一条是工具结果，请根据结果继续完成任务，不要把先前对话复述一遍。\n\n"
+        + transcript
+    )
+
+
+def _last_user_text(payload: dict) -> str:
+    return conversation_prompt(payload)
 
 
 _SKIP_EVENT_NAMES = {
@@ -410,48 +465,129 @@ async def _turn(account: dict, prompt: str, model: str, timeout: float = 90.0) -
                 pass
 
 
+async def _collect_llm(account: dict, payload: dict, model: str) -> dict:
+    text = []
+    reasoning = []
+    calls: dict[int, dict] = {}
+    usage = None
+    finish = "stop"
+    async for event in iter_llm_events(account, payload, model):
+        if event["kind"] == "usage":
+            usage = event["usage"]
+        elif event["kind"] == "output":
+            if event["text"]:
+                text.append(event["text"])
+            if event["reasoning"]:
+                reasoning.append(event["reasoning"])
+            for call in event["tool_calls"]:
+                index = int(call.get("index") or 0)
+                slot = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                if call.get("id"):
+                    slot["id"] = call["id"]
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                if function.get("name"):
+                    slot["function"]["name"] = function["name"]
+                if function.get("arguments"):
+                    slot["function"]["arguments"] += str(function["arguments"])
+        elif event["kind"] == "done" and event.get("finish_reason"):
+            finish = event["finish_reason"]
+    return {
+        "text": "".join(text),
+        "reasoning": "".join(reasoning),
+        "tool_calls": [calls[index] for index in sorted(calls)],
+        "usage": usage,
+        "finish": "tool_calls" if calls else finish,
+    }
+
+
 async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
-    model = translate_model(str(payload.get("model") or "auto"))
-    prompt = _last_user_text(payload)
-    if not prompt:
-        return (
-            "error",
-            (400, {"error": {"message": "messages must include a user turn", "type": "invalid_request_error"}}),
-        )
+    requested = str(payload.get("model") or "auto")
+    model = translate_model(requested)
     stream = bool(payload.get("stream"))
     tried: set[int] = set()
     last_error = None
+    refreshed: set[int] = set()
     for _ in range(3):
         account = await _pick(tried)
         if not account:
             break
-        tried.add(int(account["id"]))
+        account_id = int(account["id"])
+        tried.add(account_id)
         t0 = time.time()
         try:
-            turn = await _turn(account, prompt, model)
-            auth_manager.mark_account_success(account["id"])
-            _log(
-                api_key_info, account, payload.get("model") or model, stream, "stop", 200, "", t0,
-                turn.get("usage"),
-            )
-            model_name = str(payload.get("model") or model)
+            shown = requested
             if stream:
-                return (
-                    "stream",
-                    _stream_once(turn["text"], model_name, turn.get("reasoning") or "", turn.get("usage")),
-                )
+                events = iter_llm_events(account, payload, model)
+                try:
+                    first = await events.__anext__()
+                except StopAsyncIteration:
+                    first = {"kind": "done", "finish_reason": "stop"}
+
+                async def _forward(current=account, opened=events, head=first, name=shown, started=t0):
+                    saw_tools = False
+                    finish = "stop"
+                    usage = None
+                    try:
+                        pending = [head]
+                        while pending or True:
+                            event = pending.pop(0) if pending else await opened.__anext__()
+                            if event["kind"] == "usage":
+                                usage = event["usage"]
+                            elif event["kind"] == "output":
+                                calls = event["tool_calls"]
+                                if calls:
+                                    saw_tools = True
+                                if event["text"] or event["reasoning"] or calls:
+                                    yield _llm_chunk(name, text=event["text"], reasoning=event["reasoning"], tool_calls=calls or None)
+                            elif event["kind"] == "done":
+                                finish = "tool_calls" if saw_tools else (event.get("finish_reason") or "stop")
+                                break
+                    except StopAsyncIteration:
+                        pass
+                    except TraeWorkChatError as exc:
+                        yield _llm_chunk(name, text=str(exc)[:240])
+                        finish = "stop"
+                    yield _llm_chunk(name, finish=finish, usage=usage)
+                    yield b"data: [DONE]\n\n"
+                    auth_manager.mark_account_success(int(current["id"]))
+                    _log(api_key_info, current, name, True, finish, 200, "", started, usage)
+
+                return ("stream", _forward())
+            turn = await _collect_llm(account, payload, model)
+            auth_manager.mark_account_success(account_id)
+            _log(api_key_info, account, shown, False, turn["finish"], 200, "", t0, turn.get("usage"))
+            message = {"role": "assistant", "content": turn["text"]}
+            if turn["reasoning"]:
+                message["reasoning_content"] = turn["reasoning"]
+            if turn["tool_calls"]:
+                message["tool_calls"] = turn["tool_calls"]
             return (
                 "json",
-                _openai_json(model_name, turn["text"], reasoning=turn.get("reasoning") or "", usage=turn.get("usage")),
+                {
+                    "id": f"chatcmpl-traework-{uuid.uuid4().hex[:12]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": shown,
+                    "choices": [{"index": 0, "message": message, "finish_reason": turn["finish"]}],
+                    "usage": turn.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                },
             )
-        except TraeWorkAuthError as exc:
-            auth_manager.mark_account_failure(account["id"], 503)
-            last_error = ("error", (503, {"error": {"message": str(exc)[:240], "type": "server_error"}}))
-            _log(api_key_info, account, payload.get("model") or model, stream, "error", 503, str(exc)[:240], t0)
+        except TraeWorkChatError as exc:
+            if exc.retry_auth and account_id not in refreshed:
+                refreshed.add(account_id)
+                tried.discard(account_id)
+                try:
+                    await refresh_account(account)
+                except TraeWorkAuthError:
+                    pass
+            auth_manager.mark_account_failure(account_id, exc.status_code)
+            last_error = ("error", (exc.status_code, {"error": {"message": str(exc)[:240], "type": "server_error"}}))
+            _log(api_key_info, account, requested, stream, "error", exc.status_code, str(exc)[:240], t0)
             continue
-        except httpx.HTTPError as exc:
-            auth_manager.mark_account_failure(account["id"], 503)
+        except (TraeWorkAuthError, httpx.HTTPError) as exc:
+            auth_manager.mark_account_failure(account_id, 503)
             last_error = ("error", (503, {"error": {"message": str(exc)[:240], "type": "server_error"}}))
+            _log(api_key_info, account, requested, stream, "error", 503, str(exc)[:240], t0)
             continue
     return last_error or (
         "error",
@@ -504,9 +640,13 @@ async def _stream_once(
 async def test_chat(account: dict, model: str = "qwen-3.7-plus", prompt: str = "请回复：pong") -> dict:
     t0 = time.time()
     try:
-        turn = await _turn(account, prompt or "请回复：pong", translate_model(model or "auto"), timeout=90.0)
+        turn = await _collect_llm(
+            account,
+            {"model": model, "messages": [{"role": "user", "content": prompt or "请回复：pong"}]},
+            translate_model(model or "auto"),
+        )
         text = turn["text"]
-    except TraeWorkAuthError as exc:
+    except (TraeWorkAuthError, TraeWorkChatError) as exc:
         return {
             "ok": False,
             "status_code": 503,

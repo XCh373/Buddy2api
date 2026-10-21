@@ -16,11 +16,11 @@ services:
       - CB_GATEWAY_DEFAULT_REASONING_EFFORT=${CB_GATEWAY_DEFAULT_REASONING_EFFORT:-high}
       - CB_GATEWAY_DB_PATH=/app/data/buddy2api.db
       - CB_GATEWAY_AUTO_IMPORT=${CB_GATEWAY_AUTO_IMPORT:-0}
-      - CB_GATEWAY_PROVIDERS=${CB_GATEWAY_PROVIDERS:-workbuddy,qclaw,qwenwork,traework}
+      - CB_GATEWAY_PROVIDERS=${CB_GATEWAY_PROVIDERS:-workbuddy,qwenwork,traework}
       - CB_AUTH_DIR=/auth
       - CB_CONTAINER_AUTH_DIR=/auth
       - CB_DOCKER=1
-      # Official QClaw/QwenWork login files are Windows DPAPI; import them on
+      # Official QwenWork login files are Windows DPAPI; import them on
       # the host. SQLite tokens use the sidecar key file (or MASTER_KEY) so
       # Linux can use already-imported accounts. WorkBuddy still mounts /auth.
     healthcheck:

@@ -8,6 +8,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 
+import database as db
 import providers
 import responses
 from reasoning_controls import normalize_chat_reasoning
@@ -21,12 +22,46 @@ from providers.protocol import (
     UnknownModel,
 )
 
+ANY_CHANNEL = "*"
+
 
 def _key_channel(api_key_info: dict | None) -> str:
     if not api_key_info:
         return "workbuddy"
     value = str(api_key_info.get("default_channel") or "workbuddy").strip()
     return value or "workbuddy"
+
+
+def _key_allows_any(key_channel: str) -> bool:
+    return key_channel == ANY_CHANNEL
+
+
+def _channels_accepting(inner: str) -> list[str]:
+    matched = []
+    for channel in providers.enabled_provider_ids():
+        provider = providers.get_provider(channel)
+        if provider and provider.accepts_model(inner):
+            matched.append(channel)
+    return matched
+
+
+def _prefer_usable(candidates: list[str]) -> str:
+    """First candidate that already has an active account.
+
+    Used only when an any-channel key left the channel open. Quota exhaustion
+    does not count: an active account with no credits still keeps the channel.
+    If none of the candidates have an account, the first one remains so the
+    caller gets that channel's unavailable error instead of a later channel.
+    """
+    if not candidates:
+        raise UnknownChannel("")
+    for channel in candidates:
+        try:
+            if db.get_active_accounts(channel):
+                return channel
+        except Exception:
+            continue
+    return candidates[0]
 
 
 def _other_channel_ids(inner: str, except_channel: str) -> bool:
@@ -54,17 +89,32 @@ def bind(payload: dict, api_key_info: dict | None) -> BindResult:
         inner = rest
         if not inner:
             raise InvalidModel(original, f"model '{original}' is missing the inner id")
+        if providers.is_retired_channel(channel):
+            raise UnknownChannel(channel, providers.retired_message(channel))
         if not providers.is_channel_enabled(channel) or providers.get_provider(channel) is None:
             raise UnknownChannel(channel)
         provider = providers.get_provider(channel)
         if not provider.accepts_model(inner):
             raise InvalidModel(original)
-        if key_channel != channel:
+        if not _key_allows_any(key_channel) and key_channel != channel:
             raise KeyChannelMismatch(channel, key_channel)
         return BindResult(channel=channel, inner=inner, original=original)
 
-    # Unprefixed: skip step 2, bind key.default_channel
+    if _key_allows_any(key_channel):
+        if original == "auto":
+            channel = _prefer_usable(providers.enabled_provider_ids())
+        else:
+            matches = _channels_accepting(original)
+            if not matches:
+                raise UnknownModel(original)
+            channel = _prefer_usable(matches)
+        return BindResult(channel=channel, inner=original, original=original)
+
+    # Unprefixed: bind the key's own channel. A bare id from another channel
+    # stays a 400 instead of hopping over.
     channel = key_channel
+    if providers.is_retired_channel(channel):
+        raise UnknownChannel(channel, providers.retired_message(channel))
     if not providers.is_channel_enabled(channel) or providers.get_provider(channel) is None:
         raise UnknownChannel(channel)
     provider = providers.get_provider(channel)
@@ -133,6 +183,18 @@ def bind_http(payload: dict, api_key_info: dict | None) -> BindResult:
 
 
 async def ensure_usable(channel: str) -> None:
+    if providers.is_retired_channel(channel):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": providers.retired_message(channel),
+                    "type": "unknown_channel",
+                    "code": "channel_retired",
+                    "channel": channel,
+                }
+            },
+        )
     provider = providers.get_provider(channel)
     if provider is None:
         raise HTTPException(
@@ -378,7 +440,9 @@ async def _chat_after_bind_no_echo(
     info = dict(api_key_info or {})
     info["_log_model"] = bound.original
     info["_bind_channel"] = bound.channel
-    return await provider.chat_completions(dispatch, info)
+    from context_budget import dispatch_with_context_policy
+
+    return await dispatch_with_context_policy(provider, bound.channel, dispatch, info)
 
 
 async def responses_after_bind(

@@ -8,7 +8,6 @@ Codex 从 2026.2 起强制要求 wire_api="responses"，不再支持 chat/comple
 
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -88,52 +87,6 @@ def _maybe_dump(label: str, obj) -> None:
         pass
 
 
-def apply_codex_sanitize(chat_payload: dict) -> dict:
-    """
-    对 Chat Completions 请求应用 Codex 专用清洗。
-    用于 client_type='codex' 的 API Key，即使请求直接打到 /v1/chat/completions 也做清洗。
-
-    仅当请求携带 Codex 特征 prompt 时才改写；DSH/OpenClaw 等其它客户端
-    借用 codex key 时原样透传，避免清洗破坏其 agent 指令与工具定义。
-    """
-    # 无 Codex 特征：不改写
-    if not any(
-        isinstance(msg, dict) and _looks_like_codex_prompt(
-            msg.get("content") if isinstance(msg.get("content"), str) else _flatten_content(msg.get("content") or "")
-        )
-        for msg in chat_payload.get("messages") or []
-        if isinstance(msg, dict) and msg.get("role") in ("system", "developer")
-    ):
-        return chat_payload
-
-    # 清洗 system messages
-    for msg in chat_payload.get("messages", []):
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") in ("system", "developer"):
-            msg["role"] = "system"
-            content = msg.get("content", "")
-            msg["content"] = _sanitize_system_content(
-                content if isinstance(content, str) else _flatten_content(content)
-            )
-
-    # 清洗 tool descriptions
-    for tool in chat_payload.get("tools", []):
-        if isinstance(tool, dict) and tool.get("type") == "function":
-            fn = tool.get("function") or {}
-            if isinstance(fn.get("description"), str) and fn.get("description"):
-                fn["description"] = _sanitize_tool_description(fn["description"])
-
-    # 过滤非 function 类型工具
-    if chat_payload.get("tools"):
-        chat_payload["tools"] = [
-            t for t in chat_payload["tools"]
-            if isinstance(t, dict) and t.get("type") == "function" and (t.get("function") or {}).get("name")
-        ]
-
-    return chat_payload
-
-
 def _structured_response_format(resp_payload: dict) -> Optional[dict]:
     """Map Responses text.format onto Chat response_format.
 
@@ -169,11 +122,7 @@ def _structured_response_format(resp_payload: dict) -> Optional[dict]:
 
 
 def _structured_output_instruction(response_format: dict) -> Optional[str]:
-    """Ask for schema JSON without folding the constraint into instructions.
-
-    Long Codex instructions are replaced wholesale by _sanitize_system_content.
-    This must remain a separate system message so that replacement cannot drop it.
-    """
+    """Ask for schema JSON in its own system message, separate from instructions."""
     if not isinstance(response_format, dict):
         return None
     fmt_type = response_format.get("type")
@@ -218,12 +167,10 @@ def responses_to_chat(resp_payload: dict) -> dict:
     if instructions:
         inst_content = _flatten_content(instructions)
         if inst_content:
-            inst_content = _sanitize_system_content(inst_content)
-            msg = {"role": "system", "content": inst_content}
-            messages.append(msg)
+            messages.append({"role": "system", "content": inst_content})
 
-    # Keep this separate from instructions. Codex prompts longer than the
-    # sanitizer limit are replaced wholesale, which would drop an inlined schema.
+    # Keep the schema constraint in its own message so a long instruction
+    # cannot bury it.
     response_format = _structured_response_format(resp_payload)
     if response_format:
         constraint = _structured_output_instruction(response_format)
@@ -254,13 +201,8 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 })
                 pending_tool_calls = []
 
-            # 清洗 system/developer 消息
-            if chat_msg.get("role") in ("system", "developer"):
+            if chat_msg.get("role") == "developer":
                 chat_msg["role"] = "system"
-                content = chat_msg.get("content", "")
-                chat_msg["content"] = _sanitize_system_content(
-                    content if isinstance(content, str) else _flatten_content(content)
-                )
             messages.append(chat_msg)
 
         if pending_tool_calls:
@@ -288,7 +230,7 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": _sanitize_tool_description(t.get("description")),
+                    "description": t.get("description"),
                     "parameters": t.get("parameters"),
                     "strict": t.get("strict"),
                 },
@@ -425,170 +367,6 @@ def _flatten_content(content) -> str:
         return str(content.get("text", str(content)))
     return str(content)
 
-# 触发腾讯内容审核的关键词及替换映射
-# 设计原则：只替换确实会触发腾讯内容审核、且替换后不影响 codex 指令语义的词。
-# 不替换 python/bash/powershell 等工具名，否则会破坏 codex 的工具调用。
-_SANITIZE_REPLACEMENTS = [
-    # 权限/沙箱相关（codex system prompt 高频触发词）
-    ("<permissions instructions>", "<guidelines>"),
-    ("</permissions instructions>", "</guidelines>"),
-    ("Filesystem sandboxing defines which files can be read or written.", "File access is managed by the environment."),
-    ("`sandbox_mode`", "`mode`"),
-    ("sandbox_mode", "mode"),
-    ("sandbox", "workspace"),
-    ("Filesystem", "File access"),
-    ("filesystem", "file access"),
-    # 执行/命令相关
-    ("execute shell commands", "run commands"),
-    ("execute commands", "run commands"),
-    ("shell access", "command access"),
-    ("execute code", "run code"),
-    ("execute", "run"),
-    # 安全相关
-    ("security policy", "guidelines"),
-    ("security restrictions", "guidelines"),
-    ("security", "safety"),
-    # 提权/攻击相关
-    ("require_escalated", "require_approval"),
-    ("escalated permissions", "additional permissions"),
-    ("escalation", "approval"),
-    ("elevated", "standard"),
-    ("privilege escalation", "permission change"),
-    ("privilege", "permission"),
-    ("unrestricted", "standard"),
-    # 删除/破坏相关
-    ("destructive filesystem commands", "file operations"),
-    ("destructive", "impactful"),
-    ("recursive delete", "bulk removal"),
-    ("recursive remove", "bulk removal"),
-    ("delete files", "remove files"),
-    ("deletion", "removal"),
-    ("delete", "remove"),
-    # 网络相关
-    ("network access", "connectivity"),
-    ("Network access is restricted", "Connectivity is managed"),
-    # 绕过/突破
-    ("bypass", "go through"),
-    ("circumvent", "navigate"),
-    # 其他敏感词（仅替换明确会触发审核的，不动工具名）
-    ("attack", "approach"),
-    ("exploit", "use"),
-    ("vulnerability", "limitation"),
-    ("injection", "insertion"),
-    ("malicious", "unintended"),
-]
-
-# codex system prompt 的最小安全替换版本。
-# 当原始 system prompt 过长或清洗后仍可能触发审核时，用这个替换。
-_CODEX_SAFE_SYSTEM_PROMPT = (
-    "You are a coding assistant. Help the user with software development tasks. "
-    "You can read and write files, run commands, and search the codebase. "
-    "Follow the user's instructions and ask for clarification when needed."
-)
-
-# 需要从 system message 中完全移除的段落（正则匹配）
-_SANITIZE_REMOVE_SECTIONS = [
-    # 移除整个 Escalation Requests 段落
-    r"# Escalation Requests.*?(?=\n#|\n##|\Z)",
-    r"## How to request escalation.*?(?=\n#|\n##|\Z)",
-    # 移除权限说明块
-    r"<permissions instructions>.*?</permissions instructions>",
-    r"Filesystem sandboxing.*?(?=\n#|\n##|\n[A-Z]|\Z)",
-    # 移除安全策略大段描述
-    r"(?i)(security|safety)\s+(policy|guidelines?|restrictions?|rules?)[:\s].*?(?=\n\n|\n#|\n##|\Z)",
-    # 移除权限提升相关段落
-    r"(?i)(escalation|elevated|privilege).{0,200}(request|process|flow|approval).*?(?=\n\n|\n#|\n##|\Z)",
-    # 移除文件系统/沙箱相关长段
-    r"(?i)(filesystem|sandbox|file\s+access).{0,300}(restrict|manage|control|define|rule|policy).*?(?=\n\n|\n#|\n##|\Z)",
-]
-
-
-_CODEX_PROMPT_MARKERS = (
-    "<permissions instructions>",
-    "Escalation Requests",
-    "Filesystem sandboxing",
-    "sandbox_mode",
-    "require_escalated",
-    "escalated permissions",
-    "security policy",
-    "shell access",
-)
-
-
-def _looks_like_codex_prompt(content: str) -> bool:
-    """判断 system prompt 是否来自 Codex 客户端。
-
-    清洗只对 Codex 风格 prompt 生效。其他 agent（DSH、OpenClaw 等）的
-    prompt 不含这些标记，直接原样透传，避免误伤：DSH 等 harness 的
-    prompt 远超 1200 字符，一旦被兜底规则整体替换成最小安全 prompt，
-    模型会丢失全部工具使用指令，退化成纯对话。
-
-    新版 Codex 不再携带旧权限块。只在产品身份和 agent 标记同时出现时识别，
-    避免其他客户端仅提到 Codex 或 coding agent 就被改写。
-    """
-    if not content:
-        return False
-    if any(marker in content for marker in _CODEX_PROMPT_MARKERS):
-        return True
-    lowered = content.lower()
-    # 身份句必须出现在提示开头。正文里顺带提到 “you are Codex” 不能触发整段替换。
-    has_identity = lowered.lstrip().startswith("you are codex") or "codex cli" in lowered
-    has_agent_marker = any(
-        marker in lowered for marker in ("coding agent", "approval", "sandbox", "shell")
-    )
-    return has_identity and has_agent_marker
-
-
-def _sanitize_system_content(content: str) -> str:
-    """清洗 system message 内容，避免触发腾讯内容审核。
-
-    策略：
-      0) 非 Codex 特征 prompt 原样返回（不改写其他客户端）
-      1) 先用正则删除整段高风险文本
-      2) 再逐词替换已知触发词
-      3) 如果清洗后仍然过长（>1200 字符）或仍含高风险关键词，
-         直接用最小安全 prompt 替换，保证不再触发审核
-    """
-    if not content:
-        return content
-    if not _looks_like_codex_prompt(content):
-        return content
-
-    result = content
-
-    # Step 1: 移除敏感段落
-    for pattern in _SANITIZE_REMOVE_SECTIONS:
-        result = re.sub(pattern, "", result, flags=re.DOTALL | re.IGNORECASE)
-
-    # Step 2: 关键词替换
-    for old, new in _SANITIZE_REPLACEMENTS:
-        result = result.replace(old, new)
-
-    # Step 3: 兜底 —— 如果清洗后仍然太长，说明原始 prompt 包含大量我们没覆盖的
-    # 安全/权限指令，直接换成最小安全 prompt，宁可丢一些上下文也不要触发审核
-    if len(result) > 1200:
-        return _CODEX_SAFE_SYSTEM_PROMPT
-
-    return result.strip()
-
-
-def _sanitize_tool_description(desc: str) -> str:
-    """清洗 tool description，避免触发腾讯内容审核。"""
-    if not isinstance(desc, str) or not desc:
-        return desc
-
-    result = desc
-    for old, new in _SANITIZE_REPLACEMENTS:
-        result = result.replace(old, new)
-
-    # 截断过长的描述（工具描述通常不需要太长）
-    if len(result) > 200:
-        result = result[:200] + "..."
-    
-    return result
-
-
-# ============================================================
 # Chat → Responses 响应映射（非流式）
 # ============================================================
 
