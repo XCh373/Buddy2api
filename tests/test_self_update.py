@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from pathlib import Path
 
@@ -34,13 +35,195 @@ def test_check_uses_first_reachable_source(monkeypatch):
 
     monkeypatch.setattr(self_update, "_get", fake_get)
     monkeypatch.setattr(self_update, "install_kind", lambda: "git")
-    payload = asyncio.run(self_update.check(force=True))
+    payload = asyncio.run(self_update.check())
     assert payload["checked"] is True
     assert payload["latest"] == "9.9.9"
     assert payload["update_available"] is True
     assert payload["can_apply"] is True
     assert payload["source"] == "jsdelivr"
     assert payload["current"] == VERSION
+
+
+def test_forced_check_prefers_github_main_over_stale_cdn(monkeypatch):
+    requested = []
+    github_file = base64.b64encode(b'VERSION = "2.2.5"\n').decode("ascii")
+    github_file = github_file[:12] + "\n" + github_file[12:]
+
+    async def fake_get(url):
+        requested.append(url)
+        if "cdn.jsdelivr.net" in url:
+            return 200, 'VERSION = "2.1.18"\n'
+        if "api.github.com/repos/XCh373/Buddy2api/contents/version.py?ref=main" in url:
+            return 200, json.dumps({"encoding": "base64", "content": github_file})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(self_update, "_get", fake_get)
+    monkeypatch.setattr(self_update, "install_kind", lambda: "git")
+    monkeypatch.setattr(self_update, "VERSION", "2.1.18")
+    automatic = asyncio.run(self_update.check())
+    assert automatic["latest"] == "2.1.18"
+    assert automatic["source"] == "jsdelivr"
+    payload = asyncio.run(self_update.check(force=True))
+
+    assert payload["latest"] == "2.2.5"
+    assert payload["update_available"] is True
+    assert payload["can_apply"] is True
+    assert payload["source"] == "github-api"
+    assert requested == [
+        "https://cdn.jsdelivr.net/gh/XCh373/Buddy2api@main/version.py",
+        "https://api.github.com/repos/XCh373/Buddy2api/contents/version.py?ref=main",
+    ]
+
+
+def test_forced_check_same_github_version_is_checked_latest(monkeypatch):
+    content = base64.b64encode(f'VERSION = "{VERSION}"\n'.encode()).decode()
+
+    async def fake_get(url):
+        assert "https://api.github.com/repos/XCh373/Buddy2api/contents/version.py?ref=main" == url
+        return 200, json.dumps({"encoding": "base64", "content": content})
+
+    monkeypatch.setattr(self_update, "_get", fake_get)
+    payload = asyncio.run(self_update.check(force=True))
+
+    assert payload["checked"] is True
+    assert payload["latest"] == VERSION
+    assert payload["update_available"] is False
+    assert payload["can_apply"] is False
+    assert payload["source"] == "github-api"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        "[]",
+        json.dumps({"encoding": "utf-8", "content": 'VERSION = "9.9.9"'}),
+        json.dumps({"encoding": "base64", "content": "%%%"}),
+        json.dumps({"encoding": "base64", "content": base64.b64encode(b"\xff").decode()}),
+        json.dumps({"encoding": "base64", "content": base64.b64encode(b"not a version").decode()}),
+    ],
+)
+def test_github_contents_parser_rejects_malformed_payloads(payload):
+    assert self_update.parse_github_content_version(payload) is None
+
+
+def test_forced_check_rate_limit_falls_back_to_overridden_repo_raw(monkeypatch):
+    monkeypatch.setenv("CB_GATEWAY_UPDATE_REPO", "example/fork")
+    requested = []
+
+    async def fake_get(url):
+        requested.append(url)
+        if "api.github.com" in url:
+            return 403, '{"message":"API rate limit exceeded"}'
+        if url == "https://raw.githubusercontent.com/example/fork/main/version.py":
+            return 200, 'VERSION = "2.2.6"\n'
+        raise AssertionError(url)
+
+    monkeypatch.setattr(self_update, "_get", fake_get)
+    payload = asyncio.run(self_update.check(force=True))
+
+    assert payload["checked"] is True
+    assert payload["latest"] == "2.2.6"
+    assert payload["update_available"] is True
+    assert payload["source"] == "github-raw-main"
+    assert requested == [
+        "https://api.github.com/repos/example/fork/contents/version.py?ref=main",
+        "https://raw.githubusercontent.com/example/fork/main/version.py",
+    ]
+
+
+def test_automatic_check_uses_repo_override_for_cdn(monkeypatch):
+    monkeypatch.setenv("CB_GATEWAY_UPDATE_REPO", "example/fork")
+    requested = []
+
+    async def fake_get(url):
+        requested.append(url)
+        if url == "https://cdn.jsdelivr.net/gh/example/fork@main/version.py":
+            return 200, 'VERSION = "2.2.5"\n'
+        raise AssertionError(url)
+
+    monkeypatch.setattr(self_update, "_get", fake_get)
+    payload = asyncio.run(self_update.check())
+
+    assert payload["checked"] is True
+    assert payload["source"] == "jsdelivr"
+    assert requested == ["https://cdn.jsdelivr.net/gh/example/fork@main/version.py"]
+
+
+@pytest.mark.parametrize(
+    "api_status,api_text,raw_status,raw_text",
+    [
+        (403, '{"message":"rate limit"}', 404, "missing"),
+        (200, "{malformed json", 200, 'VERSION = "not-a-version"\n'),
+        (200, json.dumps({"encoding": "utf-8", "content": "VERSION = \\\"9.9.9\\\""}), 200, ""),
+        (200, json.dumps({"encoding": "base64", "content": "%%%"}), 200, "VERSION = \"\xff\""),
+    ],
+)
+def test_forced_github_sources_failure_stays_unchecked(
+    monkeypatch, api_status, api_text, raw_status, raw_text
+):
+    async def fake_get(url):
+        if "api.github.com" in url:
+            return api_status, api_text
+        if "raw.githubusercontent.com" in url:
+            return raw_status, raw_text
+        raise AssertionError(url)
+
+    monkeypatch.setattr(self_update, "_get", fake_get)
+    payload = asyncio.run(self_update.check(force=True))
+
+    assert payload["checked"] is False
+    assert payload["latest"] is None
+    assert payload["update_available"] is False
+    assert payload["can_apply"] is False
+    assert payload["source"] is None
+
+
+def test_get_keeps_four_second_timeout(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 404
+        text = ""
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, _url):
+            return Response()
+
+    monkeypatch.setattr(self_update.httpx, "AsyncClient", FakeClient)
+    assert asyncio.run(self_update._get("https://github.com/example/repo")) == (404, "")
+    assert captured["timeout"] == 4.0
+
+
+def test_forced_version_check_does_not_run_git_or_restart(monkeypatch):
+    content = base64.b64encode(b'VERSION = "2.2.6"\n').decode()
+
+    async def fake_get(url):
+        return 200, json.dumps({"encoding": "base64", "content": content})
+
+    def forbidden_run(*args, **kwargs):
+        raise AssertionError("version discovery must not execute local update commands")
+
+    def forbidden_restart(*args, **kwargs):
+        raise AssertionError("version discovery must not schedule a restart")
+
+    monkeypatch.setattr(self_update, "_get", fake_get)
+    monkeypatch.setattr(self_update, "_run", forbidden_run)
+    monkeypatch.setattr(self_update, "schedule_restart", forbidden_restart)
+    monkeypatch.setattr(self_update, "restart_now", forbidden_restart)
+    payload = asyncio.run(self_update.check(force=True))
+
+    assert payload["update_available"] is True
+    assert payload["source"] == "github-api"
 
 
 def test_check_failure_is_silent(monkeypatch):
