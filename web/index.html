@@ -1121,7 +1121,7 @@ createApp({
   <div class="ov" v-if="sa" @click.self="sa=false"><div class="modal"><div class="modal-h"><h3>高级手动添加</h3><button class="x" @click="sa=false">&times;</button></div><div class="modal-b"><div class="field"><label>名称</label><input v-model="nm" placeholder="可选"/></div><div class="field"><label>Auth JSON</label><textarea v-model="ai" placeholder="粘贴 .info 文件内容"></textarea><div class="hint">只有自动检测失败时才需要手动粘贴完整 JSON。</div></div></div><div class="modal-f"><button class="btn" @click="sa=false" :disabled="adding">取消</button><button class="btn pri" @click="add" :disabled="adding">{{adding?'添加中':'添加'}}</button></div></div></div>
 </div>`
 }).component('keys',{props:['token','toast'],setup(p){
-  const l=ref([]),ld=ref(true),sa=ref(false),df=ref(null),f=reactive({name:'',models:'',limit:null,domain:'',channel:'workbuddy'}),res=ref(''),saving=ref(false),copied=ref(false),busy=ref({}),shown=ref({}),channels=ref([{id:'workbuddy',display_name:'WorkBuddy 国内版'},{id:'workbuddy-i',display_name:'WorkBuddy 国际版'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'qoder',display_name:'Qoder 中国版'},{id:'qoder-i',display_name:'Qoder 国际版'},{id:'traework',display_name:'TraeWork'},{id:'loomy',display_name:'Loomy'},{id:'xiaohuanxiong',display_name:'小浣熊'}]);
+  const l=ref([]),ld=ref(true),sa=ref(false),df=ref(null),f=reactive({name:'',models:'',limit:null,domain:'',channel:'*'}),res=ref(''),saving=ref(false),copied=ref(false),busy=ref({}),shown=ref({}),channels=ref([{id:'workbuddy',display_name:'WorkBuddy 国内版'},{id:'workbuddy-i',display_name:'WorkBuddy 国际版'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'qoder',display_name:'Qoder 中国版'},{id:'qoder-i',display_name:'Qoder 国际版'},{id:'traework',display_name:'TraeWork'},{id:'loomy',display_name:'Loomy'},{id:'xiaohuanxiong',display_name:'小浣熊'}]);
   const anyChannel={id:'*',display_name:'自动通道'};
   function channelOptions(){const rest=channels.value.filter(c=>c.id!=='*');return [anyChannel].concat(rest)}
   function busyKey(id,k){return busy.value[id+'-'+k]}
@@ -1135,7 +1135,7 @@ createApp({
   function cp(v){navigator.clipboard.writeText(v);copied.value=true;p.toast('已复制','info');setTimeout(()=>copied.value=false,1500)}
   function toggleKey(k){shown.value={...shown.value,[k.id]:!shown.value[k.id]}}
   function tok(v){v=Number(v||0);if(v>=1e9)return (v/1e9).toFixed(v>=1e10?1:2).replace(/\.?0+$/,'')+'B';if(v>=1e6)return (v/1e6).toFixed(v>=1e7?1:2).replace(/\.?0+$/,'')+'M';return v.toLocaleString()}
-  function close(){sa.value=false;res.value='';f.name='';f.models='';f.limit=null;f.channel='workbuddy'}
+  function close(){sa.value=false;res.value='';f.name='';f.models='';f.limit=null;f.channel='*'}
   const legacyKeys=computed(()=>l.value.filter(k=>k.client_type==='codex'))
   const updatingLegacy=ref(false)
   async function updateLegacyKeys(){
@@ -1401,7 +1401,6 @@ createApp({
           <div class="field"><label>续期时刻</label><input v-model.number="s.keepalive_hour" type="number" min="0" max="23" placeholder="22"/><div class="hint">本地时间的小时，默认 22。只在该小时的前 10 分钟执行一次。</div></div>
           <div class="field"><label>定时领取积分</label><select :value="s.auto_checkin_enabled?'on':'off'" @change="s.auto_checkin_enabled=$event.target.value==='on'"><option value="off">关闭</option><option value="on">开启</option></select><div class="hint">到点后领取支持签到的通道。CB_GATEWAY_AUTO_CHECKIN=1 可强制开启，=0 强制关闭。</div></div>
           <div class="field"><label>领取时刻</label><input v-model.number="s.auto_checkin_hour" type="number" min="0" max="23" placeholder="9"/><div class="hint">本地时间的小时，默认 9。只在该小时的前 10 分钟执行一次。</div></div>
-          <div class="field"><label>Loomy 上下文预算</label><input v-model.number="s.loomy_context_budget" type="number" min="0" max="2000000" placeholder="160000"/><div class="hint">只在发送前裁 Loomy 的旧对话，默认 160000 token。填 0 关闭发送前裁剪。上游拒绝上下文时仍会再裁一次。CB_LOOMY_CONTEXT_BUDGET 可覆盖。</div></div>
         </div>
       </div>
     </div>
@@ -1420,6 +1419,14 @@ createApp({
         <tr v-for="x in automationLogs" :key="x.id"><td class="mono">{{automationTime(x.created_at)}}</td><td>{{automationText(x).source}}</td><td>{{automationText(x).job}}</td><td><span class="tag">{{x.channel||'-'}}</span></td><td>{{x.account_name||'-'}}</td><td><span class="badge" :class="automationClass(x)">{{automationText(x).outcome}}</span></td><td>{{x.message||'-'}}</td></tr>
       </tbody></table></div>
       <div class="card-p empty" v-else><p>{{automationFilter==='failed'?'最近没有失败记录':'暂无自动化日志'}}</p></div>
+    </div>
+    <div class="card">
+      <div class="card-h">上下文预算<span class="sub">只影响 Loomy 发送前裁剪</span></div>
+      <div class="card-p">
+        <div class="form-grid">
+          <div class="field"><label>Loomy 上下文预算</label><input v-model.number="s.loomy_context_budget" type="number" min="0" max="2000000" placeholder="160000"/><div class="hint">只在发送前裁 Loomy 的旧对话，默认 160000 token。填 0 关闭发送前裁剪。上游拒绝上下文时仍会再裁一次。CB_LOOMY_CONTEXT_BUDGET 可覆盖。</div></div>
+        </div>
+      </div>
     </div>
     <div class="dash-grid">
       <div class="card">

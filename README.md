@@ -4,7 +4,7 @@
 
 > 把本机已经登录的消费级 AI 客户端，接成 OpenAI 兼容接口，给 Codex、OpenCode、Cherry Studio、NextChat 等用。默认打开 Work Buddy / CodeBuddy、Qoder、千问办公（QwenWork）、TraeWork、讯飞 Loomy、商汤小浣熊；管理页下拉选其中一个。一次请求只走一个通道。QClaw 已停止运营，通道已下架，积分请改用 WorkBuddy。
 
-当前版本 **2.2.8**。默认通道含 WorkBuddy 国内/国际、Qoder 中国/国际、千问办公、TraeWork、Loomy、小浣熊。没有登录凭证的渠道不会出现在模型列表里。这个项目只供你本人持有的账号在本机使用。不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
+当前版本 **2.2.9**。默认通道含 WorkBuddy 国内/国际、Qoder 中国/国际、千问办公、TraeWork、Loomy、小浣熊。没有登录凭证的渠道不会出现在模型列表里。这个项目只供你本人持有的账号在本机使用。不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
 
 **仅限自己的账号。严禁使用接码平台、批量注册或任何批量方式薅羊毛。** 不要把网关公开给别人用，也不要代领或倒卖额度。
 
@@ -42,7 +42,7 @@ python server.py
 按下面「安装与启动」即可。这几条是 2.0 里最容易踩空的：
 
 1. **启动后账号页是空的，这是正常的。** 默认不再自动入库。到「账号」页：选通道 → 重新检测 → 一键导入。已启用的通道都能选。没有登录文件的通道不会出现在模型列表里。
-2. **一把 API Key 只打一个通道。** 创建时必须选通道。WorkBuddy 的 Key 发 `auto` / `glm-5.2`；Qoder 的 Key 发 `auto` 或 `Qwen3.8-Flash`；QwenWork 的 Key 发 `auto` 或 `qwork-advanced`；TraeWork 的 Key 发 `auto` 或 `qwen-3.7-plus`。通道和模型对不上会 400 或 403，不会帮你转到另一家。自动通道用 `qoder/DeepSeek-Flash` 这类带前缀的名字指定这一跳。
+2. **一把 API Key 只打一个通道。** 创建时默认是自动通道，只打一家时再改成具体通道。WorkBuddy 的 Key 发 `auto` / `glm-5.2`；Qoder 的 Key 发 `auto` 或 `Qwen3.8-Flash`；QwenWork 的 Key 发 `auto` 或 `qwork-advanced`；TraeWork 的 Key 发 `auto` 或 `qwen-3.7-plus`。通道和模型对不上会 400 或 403，不会帮你转到另一家。自动通道用 `qoder/DeepSeek-Flash` 这类带前缀的名字指定这一跳。
 3. **某个通道返回 503 `channel_unavailable`：** 这个通道还没导入可用账号。
 4. **QwenWork 请在 Windows 上直接跑 `python server.py`。** Linux Docker 读不了它用 DPAPI 加密的本机文件；管理页会写明这一点。WorkBuddy 可以继续用 Docker。
 5. 本项目和聊天客户端最好在同一台电脑。客户端如果跑在 Docker 里，Base URL 填 `http://host.docker.internal:8787/v1`，不要填容器自己的 `127.0.0.1`。
@@ -104,7 +104,7 @@ python server.py
 
 ### Docker
 
-官方镜像只发到 GitHub Container Registry，不发 Docker Hub。地址是 `ghcr.io/wicm84266964/buddy2api`，目前只有 `linux/amd64`。正式版发版成功后会推送同名标签，例如 `ghcr.io/wicm84266964/buddy2api:v2.2.8`，并移动 `latest`。预发布不移动 `latest`。请固定版本标签，不要默认追踪 `latest`。
+官方镜像只发到 GitHub Container Registry，不发 Docker Hub。地址是 `ghcr.io/wicm84266964/buddy2api`，目前只有 `linux/amd64`。正式版发版成功后会推送同名标签，例如 `ghcr.io/wicm84266964/buddy2api:v2.2.9`，并移动 `latest`。预发布不移动 `latest`。请固定版本标签，不要默认追踪 `latest`。
 
 第一次推送后，GitHub Packages 里的包可能是私有的。仓库所有者需要在包设置里把它改成公开，匿名 `docker pull` 才可用。这一步只做一次。
 
@@ -123,13 +123,13 @@ docker compose up -d
 不克隆源码时：
 
 ```powershell
-docker pull ghcr.io/wicm84266964/buddy2api:v2.2.8
+docker pull ghcr.io/wicm84266964/buddy2api:v2.2.9
 docker run -d --name buddy2api --restart unless-stopped `
   -p 127.0.0.1:8787:8787 `
   -v buddy2api-data:/app/data `
   -e CB_GATEWAY_ADMIN_TOKEN="cb-admin-请换成足够长的随机值" `
   -e CB_DOCKER=1 `
-  ghcr.io/wicm84266964/buddy2api:v2.2.8
+  ghcr.io/wicm84266964/buddy2api:v2.2.9
 ```
 
 ### 其他启动方式
@@ -143,7 +143,7 @@ docker run -d --name buddy2api --restart unless-stopped `
 
 1. 打开「账号」。WorkBuddy 可以点「浏览器登录」，在官方页面登录后自动入库，国内和国际站都能选。也可以点「一键导入全部通道」读取各启用通道的默认登录目录；自定义路径仅用于当前通道。未登录的通道会跳过。已入库的号用「一键续期并领取」续期并领取今日积分；只想领取时用「一键领取今日积分」。单个账号可在行菜单点「续期」。定时续期和定时领取在设置页，默认关闭，要手动打开并保存。
 2. 点该账号的「测试」，能返回一句话就说明这条通道通了。
-3. 打开「API Keys」，选择通道后创建。要一把 Key 打多家时选自动通道，模型写成 `通道/模型`。Codex 接口用 `/v1/responses`。创建后可以再显示、复制完整 Key。
+3. 打开「API Keys」，创建时默认是自动通道，模型写成 `通道/模型`。只打一家时再改成具体通道。Codex 接口用 `/v1/responses`。创建后可以再显示、复制完整 Key。
 4. 在客户端里填：
    - Base URL：`http://127.0.0.1:8787/v1`
    - API Key：刚复制的 Key
@@ -158,7 +158,7 @@ python server.py
 
 ### 更新
 
-管理页打开后会在后台核对远端版本（优先走 jsDelivr，不挡页面）。有新版本时顶栏出现「更新到 vx.y.z」，点一下会 `git pull --ff-only`、安装依赖并重启。查不到远端版本时不会报错。Docker、不是 git 克隆、或不在 `main` 上时，按钮会说明原因，仍可用下面的手动步骤。Docker 安装请拉取 compose 钉住的版本后重启：`docker compose pull`，然后 `docker compose up -d`。本机已是最新、只想看按钮时：`$env:CB_GATEWAY_FAKE_LATEST="9.9.9"` 再启动，点下去不会真的拉取或重启。
+管理页打开后会在后台核对远端版本（优先走 jsDelivr，不挡页面）。有新版本时顶栏出现「更新到 vx.y.z」，点一下会 `git pull --ff-only`、安装依赖并重启。这次拉取和安装会沿用已有的 `HTTPS_PROXY`、`ALL_PROXY`，或系统代理里的明确地址；不写死端口，也不改 Git 配置。只填了自动配置脚本（PAC）、没有具体地址时，Git 仍会直连。查不到远端版本时不会报错。Docker、不是 git 克隆、或不在 `main` 上时，按钮会说明原因，仍可用下面的手动步骤。Docker 安装请拉取 compose 钉住的版本后重启：`docker compose pull`，然后 `docker compose up -d`。本机已是最新、只想看按钮时：`$env:CB_GATEWAY_FAKE_LATEST="9.9.9"` 再启动，点下去不会真的拉取或重启。
 
 先 `Ctrl+C` 停掉正在跑的服务：
 
