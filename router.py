@@ -420,14 +420,14 @@ async def echo_original(result: tuple, original: str) -> tuple:
 
 
 async def chat_after_bind(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+    bound: BindResult, payload: dict, api_key_info: dict | None, *, affinity=None
 ) -> tuple:
-    result = await _chat_after_bind_no_echo(bound, payload, api_key_info)
+    result = await _chat_after_bind_no_echo(bound, payload, api_key_info, affinity=affinity)
     return await echo_original(result, bound.original)
 
 
 async def _chat_after_bind_no_echo(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+    bound: BindResult, payload: dict, api_key_info: dict | None, *, affinity=None
 ) -> tuple:
     provider = providers.get_provider(bound.channel)
     if provider is None:
@@ -440,19 +440,21 @@ async def _chat_after_bind_no_echo(
     info = dict(api_key_info or {})
     info["_log_model"] = bound.original
     info["_bind_channel"] = bound.channel
+    if affinity is not None:
+        info["_session_affinity"] = affinity
     from context_budget import dispatch_with_context_policy
 
     return await dispatch_with_context_policy(provider, bound.channel, dispatch, info)
 
 
 async def responses_after_bind(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+    bound: BindResult, payload: dict, api_key_info: dict | None, *, affinity=None
 ) -> tuple:
     """Bridge Responses through the provider selected by the existing bind."""
     dispatch = dispatch_payload(payload, bound.inner)
 
     async def chat_handler(chat_payload: dict, _api_key_info: dict | None) -> tuple:
-        return await _chat_after_bind_no_echo(bound, chat_payload, api_key_info)
+        return await _chat_after_bind_no_echo(bound, chat_payload, api_key_info, affinity=affinity)
 
     result = await responses.proxy_responses(
         dispatch,

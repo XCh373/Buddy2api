@@ -21,6 +21,8 @@ import httpx
 import database as db
 import auth_manager
 import workbuddy_outbound
+import session_identity
+from starlette.concurrency import run_in_threadpool
 from reasoning_controls import (
     chat_reasoning_effort,
     resolve_reasoning_control,
@@ -726,8 +728,8 @@ def _log_request(api_key_info, account, model_name, stream,
                   increment_usage: bool = True):
     elapsed_ms = int((time.time() - t0) * 1000)
     log_data = {
-        "api_key_id": api_key_info["id"] if api_key_info else None,
-        "api_key_name": api_key_info["name"] if api_key_info else None,
+        "api_key_id": api_key_info.get("id") if api_key_info else None,
+        "api_key_name": api_key_info.get("name") if api_key_info else None,
         "account_id": account["id"] if account else None,
         "account_name": account.get("name") if account else None,
         "provider": (account.get("provider") if account else None)
@@ -751,6 +753,44 @@ def _log_request(api_key_info, account, model_name, stream,
         pass
 
 
+def _request_identity(info, provider):
+    value = info.get("_session_affinity") if isinstance(info, dict) else None
+    return value if isinstance(value, session_identity.Identity) and value.channel == provider else None
+
+
+async def _pick_for_request(tried, info, provider):
+    identity = _request_identity(info, provider)
+    if identity is None:
+        return await auth_manager.pick_account_with_fallback(tried, provider=provider)
+    return await auth_manager.pick_account_with_fallback(tried, provider=provider, affinity=identity)
+
+
+def _acquire_affinity(identity):
+    import session_affinity
+    config = session_identity.load_config()
+    if not config["enabled"]:
+        return None
+    return session_affinity.get_store(config).pin(identity)
+
+
+async def _leased_stream(stream, lease):
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await stream.aclose()
+        await run_in_threadpool(lease.close)
+
+
+async def _recheck_first(account, info, provider):
+    def valid():
+        candidates = [a for a in db.get_active_accounts(provider) if not auth_manager.account_is_cooling_down(a["id"])]
+        highest = max((auth_manager._route_priority(a) for a in candidates), default=None)
+        return next((a for a in candidates if a["id"] == account["id"] and auth_manager._route_priority(a) == highest), None)
+    fresh = await run_in_threadpool(valid)
+    return fresh or await _pick_for_request(set(), info, provider)
+
+
 async def _json_chat_with_retries(
     body: dict,
     api_key_info: Optional[dict],
@@ -762,7 +802,10 @@ async def _json_chat_with_retries(
     last_error = None
 
     for attempt in range(max_retries):
-        account = await auth_manager.pick_account_with_fallback(tried_ids, provider=provider)
+        try:
+            account = await _pick_for_request(tried_ids, api_key_info, provider)
+        except session_identity.StateUnavailable:
+            return session_identity.state_error()
         if not account:
             break
 
@@ -844,12 +887,30 @@ async def proxy_chat_completions(
         log_model = api_key_info.get("_log_model")
     model_name = log_model if log_model is not None else payload.get("model", "auto")
 
+    identity = _request_identity(api_key_info, provider)
+    lease = None
+    if identity is not None:
+        try:
+            lease = await run_in_threadpool(_acquire_affinity, identity)
+        except session_identity.StateUnavailable:
+            return session_identity.state_error()
+    if lease is not None:
+        try:
+            if client_wants_stream:
+                first = await _pick_for_request(set(), api_key_info, provider)
+                if first is None:
+                    return ("error", (503, {"error": {"message": "No available accounts", "type": "server_error"}}))
+                stream = _leased_stream(_stream_upstream(body, api_key_info, model_name, provider, first_account=first), lease)
+                lease = None  # ownership transferred to the stream
+                return ("stream", stream)
+            return await _json_chat_with_retries(body, api_key_info, model_name, provider)
+        except session_identity.StateUnavailable:
+            return session_identity.state_error()
+        finally:
+            if lease is not None:
+                await run_in_threadpool(lease.close)
     if client_wants_stream:
-        return (
-            "stream",
-            _stream_upstream(body, api_key_info, model_name, provider),
-        )
-
+        return ("stream", _stream_upstream(body, api_key_info, model_name, provider))
     return await _json_chat_with_retries(body, api_key_info, model_name, provider)
 
 
@@ -905,6 +966,7 @@ async def _stream_upstream(
     api_key_info: Optional[dict],
     model_name: str,
     provider: str = "workbuddy",
+    *, first_account=None,
 ) -> AsyncGenerator[bytes, None]:
     """Stream upstream SSE with pre-output account failover and backoff."""
     tried_ids: set[int] = set()
@@ -917,7 +979,14 @@ async def _stream_upstream(
     pending_retry_log: dict | None = None
 
     for attempt in range(3):
-        account = await auth_manager.pick_account_with_fallback(tried_ids, provider=provider)
+        try:
+            account = (await _recheck_first(first_account, api_key_info, provider)
+                       if attempt == 0 and first_account is not None
+                       else await _pick_for_request(tried_ids, api_key_info, provider))
+        except session_identity.StateUnavailable:
+            yield _json_sse_event(session_identity.state_error()[1][1])
+            yield b"data: [DONE]\n\n"
+            return
         if not account:
             break
         if pending_retry_log is not None:

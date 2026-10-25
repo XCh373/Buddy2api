@@ -1240,8 +1240,25 @@ def workbuddy_channel_for_domain(domain: str) -> str:
 def pick_account(
     exclude_ids: set[int] = None,
     provider: str = "workbuddy",
+    *, affinity=None,
 ) -> Optional[dict]:
     """Pick an available account. Higher priority first; stick to the current one on ties."""
+    if affinity is not None:
+        import session_identity
+        import session_affinity
+        config = session_identity.load_config()
+        if config["enabled"] and isinstance(affinity, session_identity.Identity) and affinity.channel == provider:
+            def eligible():
+                # Re-read under the binding lock: an older queued snapshot must not undo a migration.
+                return [a for a in db.get_active_accounts(provider) if not account_is_cooling_down(a["id"])]
+            routing = account_routing.load_config() if provider == "workbuddy" else dict(account_routing.DEFAULTS)
+            def choose(candidates):
+                snapshots = account_routing.read_snapshots(candidates) if routing["mode"] == "expiry_first" else {}
+                top, _ = account_routing.best_group(candidates, routing, snapshots)
+                with _route_lock:
+                    sticky_id = _sticky_account_id.get(provider)
+                return next((a for a in top if a["id"] == sticky_id), None) or min(top, key=_route_sort_key)
+            return session_affinity.get_store(config).select(affinity, eligible, exclude_ids or set(), choose, config)
     exclude_ids = exclude_ids or set()
     accounts = db.get_active_accounts(provider)
     candidates = [
@@ -1299,9 +1316,19 @@ def routing_preview() -> dict:
 async def pick_account_with_fallback(
     exclude_ids: set[int] = None,
     provider: str = "workbuddy",
+    *, affinity=None,
 ) -> Optional[dict]:
     """Pick an account; refresh expired ones if needed. Only refreshes the same provider."""
-    account = pick_account(exclude_ids, provider=provider)
+    from starlette.concurrency import run_in_threadpool
+    if affinity is not None:
+        import session_identity
+        config = await run_in_threadpool(session_identity.load_config)
+        if not config["enabled"]:
+            affinity = None
+    if affinity is None:
+        account = pick_account(exclude_ids, provider=provider)
+    else:
+        account = await run_in_threadpool(lambda: pick_account(exclude_ids, provider=provider, affinity=affinity))
     if account:
         return account
     expired_accounts = sorted(
@@ -1318,6 +1345,11 @@ async def pick_account_with_fallback(
         if await refresh_token(a):
             fresh = db.get_account(a["id"])
             if fresh:
+                if affinity is not None:
+                    account = await run_in_threadpool(lambda: pick_account(exclude_ids, provider=provider, affinity=affinity))
+                    if account:
+                        return account
+                    continue
                 _set_sticky_account(fresh["id"], provider)
                 return fresh
     return None

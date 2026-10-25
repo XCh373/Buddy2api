@@ -416,6 +416,22 @@ def init_db():
         """)
         _migrate_account_credentials(conn)
         _migrate_daily_usage(conn)
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS session_bindings (
+            binding_key TEXT PRIMARY KEY,
+            api_key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+            provider_channel TEXT NOT NULL,
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            generation INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bindings_expiry ON session_bindings(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_bindings_caller ON session_bindings(api_key_id, last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_bindings_lru ON session_bindings(last_seen_at);
+
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
         _prune_logs(conn)
         conn.execute("PRAGMA optimize")
@@ -768,6 +784,8 @@ def delete_account(aid: int):
         conn.execute("DELETE FROM accounts WHERE id=?", (aid,))
         conn.commit()
         conn.close()
+    import session_affinity
+    session_affinity.invalidate(account=aid)
 
 
 def get_account(aid: int) -> Optional[dict]:
@@ -1041,6 +1059,8 @@ def delete_api_key(kid: int):
         conn.execute("DELETE FROM api_keys WHERE id=?", (kid,))
         conn.commit()
         conn.close()
+    import session_affinity
+    session_affinity.invalidate(caller=kid)
 
 
 def get_api_key_by_key(key: str) -> Optional[dict]:

@@ -20,6 +20,7 @@ from reasoning_controls import normalize_chat_reasoning
 _DEBUG_SECRET_KEYS = {
     "access_token", "accesstoken", "refresh_token", "refreshtoken",
     "api_key", "authorization", "session_state", "sessionstate",
+    "_session_affinity", "prompt_cache_key", "session_id", "conversation_id", "chat_id", "thread_id",
 }
 _DEBUG_CONTENT_KEYS = {"content", "input", "instructions", "output"}
 _RESPONSE_ERROR_CODES = frozenset({
