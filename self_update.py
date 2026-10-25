@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -180,7 +183,11 @@ async def _fetch_latest() -> tuple[str | None, str | None]:
     return None, None
 
 
-def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+_PROXY_ENV_NAMES = ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY")
+_PROXY_SCHEMES = {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}
+
+
+def _spawn(args: list[str], timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:
     kwargs = {
         "args": args,
         "cwd": str(ROOT),
@@ -190,9 +197,277 @@ def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess:
         "encoding": "utf-8",
         "errors": "replace",
     }
+    if env is not None:
+        kwargs["env"] = env
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.run(**kwargs)
+
+
+def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+    overlay = _proxy_env_overlay(args)
+    env = None
+    if overlay:
+        env = os.environ.copy()
+        env.update(overlay)
+    return _spawn(args, timeout, env)
+
+
+def _command_uses_network(args: list[str]) -> bool:
+    if not args:
+        return False
+    if args[0] == "git" and "pull" in args:
+        return True
+    return "-m" in args and "pip" in args
+
+
+def _existing_proxy_env() -> str:
+    for name in _PROXY_ENV_NAMES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _git_has_proxy_config() -> bool:
+    probes = (
+        ["git", "config", "--get", "http.proxy"],
+        ["git", "config", "--get-regexp", r"^http\..+\.proxy$"],
+    )
+    for args in probes:
+        try:
+            result = _spawn(args, 8)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def _git_remote_url() -> str:
+    try:
+        result = _spawn(["git", "remote", "get-url", "origin"], 8)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _host_from_git_url(url: str) -> str | None:
+    text = url.strip()
+    if not text:
+        return None
+    if "://" in text:
+        return urlparse(text).hostname
+    if text.startswith("git@") and ":" in text:
+        host = text.split("@", 1)[1].split(":", 1)[0]
+        return host or None
+    return None
+
+
+def _command_host(args: list[str]) -> str:
+    if args and args[0] == "git":
+        return _host_from_git_url(_git_remote_url()) or "github.com"
+    return "pypi.org"
+
+
+def _normalize_proxy_url(value: object, default_scheme: str = "http") -> str | None:
+    text = str(value or "").strip()
+    if not text or any(ch.isspace() for ch in text):
+        return None
+    if "://" not in text:
+        text = f"{default_scheme}://{text}"
+    scheme, rest = text.split("://", 1)
+    scheme = scheme.lower()
+    if scheme == "socks":
+        scheme = "socks5"
+    if scheme not in _PROXY_SCHEMES or not rest:
+        return None
+    text = f"{scheme}://{rest}"
+    if not urlparse(text).hostname:
+        return None
+    return text
+
+
+def _first_proxy_url(proxies: dict) -> str | None:
+    for key, scheme in (
+        ("https", "http"),
+        ("all", "http"),
+        ("http", "http"),
+        ("socks5", "socks5"),
+        ("socks", "socks5"),
+    ):
+        normalized = _normalize_proxy_url(proxies.get(key), scheme)
+        if normalized:
+            return normalized
+    return None
+
+
+def _host_bypasses_proxy(host: str, no_proxy: str) -> bool:
+    name = (host or "").strip().lower().rstrip(".")
+    if not name:
+        return False
+    for raw in re.split(r"[,;\s]+", no_proxy or ""):
+        pattern = raw.strip().lower().rstrip(".")
+        if not pattern:
+            continue
+        if pattern == "*":
+            return True
+        if pattern == "<local>":
+            if "." not in name and ":" not in name:
+                return True
+            continue
+        if pattern.startswith("*."):
+            suffix = pattern[2:]
+            if name == suffix or name.endswith("." + suffix):
+                return True
+            continue
+        if pattern.startswith("."):
+            suffix = pattern[1:]
+            if name == suffix or name.endswith("." + suffix):
+                return True
+            continue
+        if "*" in pattern:
+            if fnmatch.fnmatch(name, pattern):
+                return True
+            continue
+        if name == pattern or name.endswith("." + pattern):
+            return True
+    return False
+
+
+def _proxy_url_for_host(host: str, proxies: dict) -> str | None:
+    if _host_bypasses_proxy(host, str(proxies.get("no") or "")):
+        return None
+    return _first_proxy_url(proxies)
+
+
+def _curl_no_proxy(no_proxy: str) -> str:
+    items = []
+    for raw in re.split(r"[,;\s]+", no_proxy or ""):
+        pattern = raw.strip()
+        if not pattern or pattern.lower() == "<local>":
+            continue
+        if pattern == "*":
+            return "*"
+        if pattern.startswith("*."):
+            items.append(pattern[1:])
+            continue
+        if "*" in pattern:
+            continue
+        items.append(pattern)
+    return ",".join(items)
+
+
+def _windows_proxy_override() -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            value, _kind = winreg.QueryValueEx(key, "ProxyOverride")
+    except (OSError, ImportError, ValueError):
+        return ""
+    return str(value or "").strip()
+
+
+def _system_proxies() -> dict:
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        proxies = {}
+    if not isinstance(proxies, dict):
+        proxies = {}
+    else:
+        proxies = dict(proxies)
+    if not str(proxies.get("no") or "").strip():
+        override = _windows_proxy_override()
+        if override:
+            proxies["no"] = override
+    return proxies
+
+
+def _proxy_for_command(args: list[str], proxies: dict) -> str | None:
+    no = str(proxies.get("no") or "")
+    if args and args[0] == "git":
+        return _proxy_url_for_host(_command_host(args), proxies)
+    hosts = ("pypi.org", "files.pythonhosted.org", "pypi.python.org")
+    if all(_host_bypasses_proxy(host, no) for host in hosts):
+        return None
+    return _first_proxy_url(proxies)
+
+
+def _proxy_env_overlay(args: list[str]) -> dict[str, str]:
+    """Return proxy variables for this command, without writing Git config.
+
+    An existing Git http.proxy or process proxy variable wins. Otherwise use
+    the OS proxy address reported by urllib. Ports are never hardcoded.
+    """
+    if not _command_uses_network(args):
+        return {}
+    existing = _existing_proxy_env()
+    if existing:
+        if os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY"):
+            return {}
+        return {"https_proxy": existing, "HTTPS_PROXY": existing}
+    if args and args[0] == "git" and _git_has_proxy_config():
+        return {}
+    proxies = _system_proxies()
+    proxy = _proxy_for_command(args, proxies)
+    if not proxy:
+        return {}
+    overlay = {
+        "http_proxy": proxy,
+        "HTTP_PROXY": proxy,
+        "https_proxy": proxy,
+        "HTTPS_PROXY": proxy,
+    }
+    if proxy.split("://", 1)[0].startswith("socks"):
+        overlay["all_proxy"] = proxy
+        overlay["ALL_PROXY"] = proxy
+    no_proxy = _curl_no_proxy(str(proxies.get("no") or ""))
+    if no_proxy and not os.environ.get("no_proxy") and not os.environ.get("NO_PROXY"):
+        overlay["no_proxy"] = no_proxy
+        overlay["NO_PROXY"] = no_proxy
+    return overlay
+
+
+def _looks_like_connect_failure(text: str) -> bool:
+    lowered = text.lower()
+    if "github.com" not in lowered and "443" not in lowered:
+        return False
+    markers = (
+        "failed to connect",
+        "could not connect",
+        "couldn't connect",
+        "unable to access",
+        "connection refused",
+        "connection timed out",
+        "timed out",
+        "could not resolve",
+        "connection reset",
+        "recv failure",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _pull_failure_message(detail: str) -> str:
+    text = detail.strip() or "git pull 失败"
+    if not _looks_like_connect_failure(text):
+        return text[:400]
+    used_proxy = bool(_proxy_env_overlay(["git", "pull", "--ff-only"]))
+    if used_proxy:
+        hint = "已沿用当前环境或系统代理，仍连不上 GitHub。"
+    else:
+        hint = "未发现环境变量或系统代理地址。只配置 PAC 时，请给 Git 设置 http.proxy，或在启动前设置 HTTPS_PROXY。"
+    if hint in text:
+        return text[:400]
+    return f"{text[:220].rstrip()} {hint}"[:400]
 
 
 def _git_ready() -> str | None:
@@ -277,7 +552,7 @@ def apply() -> dict:
         return {"ok": False, "restart": False, "message": "git pull 超时"}
     if pull.returncode != 0:
         detail = (pull.stderr or pull.stdout or "git pull 失败").strip()
-        return {"ok": False, "restart": False, "message": detail[:400]}
+        return {"ok": False, "restart": False, "message": _pull_failure_message(detail)}
     new_version = _local_version()
     if not is_newer(new_version, snapshot["current"]) and new_version == snapshot["current"]:
         return {
