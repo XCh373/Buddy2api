@@ -20,6 +20,7 @@ from reasoning_controls import normalize_chat_reasoning
 _DEBUG_SECRET_KEYS = {
     "access_token", "accesstoken", "refresh_token", "refreshtoken",
     "api_key", "authorization", "session_state", "sessionstate",
+    "_session_affinity", "prompt_cache_key", "session_id", "conversation_id", "chat_id", "thread_id",
 }
 _DEBUG_CONTENT_KEYS = {"content", "input", "instructions", "output"}
 _RESPONSE_ERROR_CODES = frozenset({
@@ -708,8 +709,9 @@ async def chat_stream_to_responses_stream(
     yield event("response.created", response=response_snapshot("in_progress"))
     yield event("response.in_progress", response=response_snapshot("in_progress"))
 
+    data_stream = _iter_chat_sse_data(chat_stream)
     try:
-        async for data_str in _iter_chat_sse_data(chat_stream):
+        async for data_str in data_stream:
             data_str = data_str.strip()
             if not data_str:
                 continue
@@ -972,6 +974,16 @@ async def chat_stream_to_responses_stream(
             "code": "upstream_stream_error",
             "message": f"The upstream SSE stream failed: {exc}",
         }
+
+    finally:
+        # A terminal/error event can stop parsing before the Chat iterator ends.
+        # Explicitly close it; async-generator GC timing is not ownership.
+        try:
+            await data_stream.aclose()
+        finally:
+            close = getattr(chat_stream, "aclose", None)
+            if close is not None:
+                await close()
 
     terminal_status = "completed"
     incomplete_reason = None
