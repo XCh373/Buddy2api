@@ -380,31 +380,37 @@ def _rewrite_json_model(obj, original: str):
 
 
 async def _rewrite_stream_model(stream, original: str):
-    async for chunk in stream:
-        if not isinstance(chunk, (bytes, bytearray, str)):
-            yield chunk
-            continue
-        text = chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else chunk
-        rewritten = []
-        for line in text.splitlines(keepends=True):
-            raw = line[:-1] if line.endswith("\n") else line
-            ended = line.endswith("\n")
-            if raw.startswith("data:") and raw[5:].strip() not in {"", "[DONE]"}:
-                data = raw[5:]
-                if data.startswith(" "):
-                    data = data[1:]
-                try:
-                    parsed = json.loads(data)
-                except json.JSONDecodeError:
+    try:
+        async for chunk in stream:
+            if not isinstance(chunk, (bytes, bytearray, str)):
+                yield chunk
+                continue
+            text = chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else chunk
+            rewritten = []
+            for line in text.splitlines(keepends=True):
+                raw = line[:-1] if line.endswith("\n") else line
+                ended = line.endswith("\n")
+                if raw.startswith("data:") and raw[5:].strip() not in {"", "[DONE]"}:
+                    data = raw[5:]
+                    if data.startswith(" "):
+                        data = data[1:]
+                    try:
+                        parsed = json.loads(data)
+                    except json.JSONDecodeError:
+                        rewritten.append(line)
+                        continue
+                    parsed = _rewrite_json_model(parsed, original)
+                    new_line = "data: " + json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                    rewritten.append(new_line + ("\n" if ended else ""))
+                else:
                     rewritten.append(line)
-                    continue
-                parsed = _rewrite_json_model(parsed, original)
-                new_line = "data: " + json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-                rewritten.append(new_line + ("\n" if ended else ""))
-            else:
-                rewritten.append(line)
-        out = "".join(rewritten)
-        yield out.encode("utf-8") if isinstance(chunk, (bytes, bytearray)) else out
+            out = "".join(rewritten)
+            yield out.encode("utf-8") if isinstance(chunk, (bytes, bytearray)) else out
+
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 async def echo_original(result: tuple, original: str) -> tuple:
@@ -420,14 +426,14 @@ async def echo_original(result: tuple, original: str) -> tuple:
 
 
 async def chat_after_bind(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+    bound: BindResult, payload: dict, api_key_info: dict | None, *, affinity=None
 ) -> tuple:
-    result = await _chat_after_bind_no_echo(bound, payload, api_key_info)
+    result = await _chat_after_bind_no_echo(bound, payload, api_key_info, affinity=affinity)
     return await echo_original(result, bound.original)
 
 
 async def _chat_after_bind_no_echo(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+    bound: BindResult, payload: dict, api_key_info: dict | None, *, affinity=None
 ) -> tuple:
     provider = providers.get_provider(bound.channel)
     if provider is None:
@@ -440,19 +446,21 @@ async def _chat_after_bind_no_echo(
     info = dict(api_key_info or {})
     info["_log_model"] = bound.original
     info["_bind_channel"] = bound.channel
+    if affinity is not None:
+        info["_session_affinity"] = affinity
     from context_budget import dispatch_with_context_policy
 
     return await dispatch_with_context_policy(provider, bound.channel, dispatch, info)
 
 
 async def responses_after_bind(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+    bound: BindResult, payload: dict, api_key_info: dict | None, *, affinity=None
 ) -> tuple:
     """Bridge Responses through the provider selected by the existing bind."""
     dispatch = dispatch_payload(payload, bound.inner)
 
     async def chat_handler(chat_payload: dict, _api_key_info: dict | None) -> tuple:
-        return await _chat_after_bind_no_echo(bound, chat_payload, api_key_info)
+        return await _chat_after_bind_no_echo(bound, chat_payload, api_key_info, affinity=affinity)
 
     result = await responses.proxy_responses(
         dispatch,

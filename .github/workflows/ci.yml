@@ -26,4 +26,6 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m compileall -q .
-      - run: python -m pytest -q
+      # Fail closed on network/credential access. The isolated service lifecycle
+      # test covers restart, duplicate startup, DB locking and stale cookies.
+      - run: python tests/offline_runner.py -q -k 'not test_repeated_start_and_restart'

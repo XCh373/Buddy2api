@@ -304,41 +304,52 @@ def _finalize(channel: str, result: tuple, trimmed: bool, prompt_tokens: int) ->
 
 
 async def _guard_stream(provider, channel, payload, info, stream, already_trimmed, prompt_tokens):
-    buffered = []
-    text = ""
-    async for chunk in stream:
-        buffered.append(chunk)
-        text += _chunk_text(chunk)
-        if _chunk_has_content(text):
-            for item in buffered:
-                yield item
-            async for item in stream:
-                yield item
-            return
-        payloads = _sse_payloads(text)
-        if payloads and all("error" in item for item in payloads):
-            detail = payloads[-1]
-            if is_context_rejection(502, detail, prompt_tokens=prompt_tokens):
-                recovered = await _retry(provider, channel, payload, info, already_trimmed)
-                async for item in _yield_result(recovered):
+    try:
+        buffered = []
+        text = ""
+        async for chunk in stream:
+            buffered.append(chunk)
+            text += _chunk_text(chunk)
+            if _chunk_has_content(text):
+                for item in buffered:
+                    yield item
+                async for item in stream:
                     yield item
                 return
-            if _detail_html(detail):
-                yield _error_sse(readable_error(channel, kind="html", trimmed=False, status=502)[1][1])
-                return
-            break
-        if len(buffered) >= 4:
-            break
-    for item in buffered:
-        yield item
-    async for item in stream:
-        yield item
+            payloads = _sse_payloads(text)
+            if payloads and all("error" in item for item in payloads):
+                detail = payloads[-1]
+                if is_context_rejection(502, detail, prompt_tokens=prompt_tokens):
+                    recovered = await _retry(provider, channel, payload, info, already_trimmed)
+                    async for item in _yield_result(recovered):
+                        yield item
+                    return
+                if _detail_html(detail):
+                    yield _error_sse(readable_error(channel, kind="html", trimmed=False, status=502)[1][1])
+                    return
+                break
+            if len(buffered) >= 4:
+                break
+        for item in buffered:
+            yield item
+        async for item in stream:
+            yield item
+
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 async def _yield_result(result: tuple):
     if result[0] == "stream":
-        async for chunk in result[1]:
-            yield chunk
+        try:
+            async for chunk in result[1]:
+                yield chunk
+        finally:
+            close = getattr(result[1], "aclose", None)
+            if close is not None:
+                await close()
         return
     if result[0] == "error":
         yield _error_sse(result[1][1] if isinstance(result[1][1], dict) else {"error": {"message": "上下文超限"}})

@@ -53,6 +53,7 @@ from version import VERSION
 import self_update
 import account_routing
 import routing_refresh
+import session_identity
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -98,7 +99,8 @@ app.add_middleware(
     allow_origins=_CORS_ORIGINS,
     allow_credentials="*" not in _CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Api-Key"],
+    allow_headers=["Authorization", "Content-Type", "X-Api-Key",
+                   "X-Buddy2api-Session-Id", "X-Buddy2api-Session-Namespace", "session_id"],
 )
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -476,10 +478,17 @@ async def chat_completions(
 
     bound = router.bind_http(payload, api_key_info)
     _check_model_access(api_key_info, bound.original, bound.inner, bound.channel)
+    try:
+        affinity = await run_in_threadpool(session_identity.from_request, request, api_key_info, bound.channel,
+                                           "chat")
+    except session_identity.IdentityError:
+        raise HTTPException(status_code=400, detail={"error": {"code": "invalid_session_identity", "message": "Invalid session identity"}}) from None
+    except session_identity.StateUnavailable:
+        return JSONResponse(status_code=503, content=session_identity.state_error()[1][1])
     await router.ensure_usable(bound.channel)
     await run_in_threadpool(_reserve_client_quota, api_key_info)
 
-    result = await router.chat_after_bind(bound, payload, api_key_info)
+    result = await router.chat_after_bind(bound, payload, api_key_info, affinity=affinity)
 
     if result[0] == "error":
         status, detail = result[1]
@@ -518,12 +527,19 @@ async def resp_responses(
         raise _invalid_reasoning_http(exc) from exc
     bound = router.bind_http(payload, api_key_info)
     _check_model_access(api_key_info, bound.original, bound.inner, bound.channel)
+    try:
+        affinity = await run_in_threadpool(session_identity.from_request, request, api_key_info, bound.channel,
+                                           "responses")
+    except session_identity.IdentityError:
+        raise HTTPException(status_code=400, detail={"error": {"code": "invalid_session_identity", "message": "Invalid session identity"}}) from None
+    except session_identity.StateUnavailable:
+        return JSONResponse(status_code=503, content=session_identity.state_error()[1][1])
     if api_key_info and api_key_info.get("client_type") == "codex":
         payload = router.trim_codex_prompt(payload, bound.channel, bound.inner)
     await router.ensure_usable(bound.channel)
     await run_in_threadpool(_reserve_client_quota, api_key_info)
     try:
-        result = await router.responses_after_bind(bound, payload, api_key_info)
+        result = await router.responses_after_bind(bound, payload, api_key_info, affinity=affinity)
     except Exception as e:
         import traceback
         sys.stderr.write(f"[responses] ERROR: {e}\n{traceback.format_exc()}\n")
@@ -1145,6 +1161,7 @@ async def admin_apply_update(authorization: str | None = Header(default=None)):
 async def admin_get_settings(authorization: str | None = Header(default=None)):
     _check_admin(authorization)
     settings = db.get_all_settings()
+    settings.pop(session_identity.SECRET_SETTING, None)
     try:
         settings[account_routing.SETTING] = account_routing.normalize_config(settings.get(account_routing.SETTING))
     except (ValueError, TypeError):
@@ -1172,6 +1189,7 @@ async def admin_update_settings(
         "default_domain",
         "timeout",
         account_routing.SETTING,
+        session_identity.SETTING,
         "keepalive_enabled",
         "keepalive_hour",
         "auto_checkin_enabled",
@@ -1200,6 +1218,11 @@ async def admin_update_settings(
                 raise ValueError("workbuddy_routing must be an object")
             data[account_routing.SETTING] = account_routing.normalize_config(data[account_routing.SETTING])
         except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if session_identity.SETTING in data:
+        try:
+            data[session_identity.SETTING] = session_identity.normalize_config(data[session_identity.SETTING])
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "loomy_context_budget" in data:
         try:
