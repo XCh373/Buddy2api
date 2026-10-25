@@ -515,3 +515,63 @@ def test_cancellation_during_lease_acquisition_does_not_leak_pin(wire, monkeypat
         await asyncio.sleep(.02)  # let the worker discard its cancelled result and finalize the lease
     asyncio.run(run())
     assert not store.active and not captures
+
+
+@pytest.mark.parametrize('path', ['chat', 'responses'])
+@pytest.mark.parametrize('upstream_error', [False, True])
+def test_completed_response_releases_pin_without_generator_gc(wire, monkeypatch, path, upstream_error):
+    # Keep the leased iterator alive: completion must close it explicitly,
+    # rather than depending on interpreter-specific async-generator GC timing.
+    held = []
+    original = proxy._leased_stream
+    def retain(stream, lease):
+        result = original(stream, lease)
+        held.append(result)
+        return result
+    monkeypatch.setattr(proxy, '_leased_stream', retain)
+    if upstream_error:
+        wire[4].update({aid: 500 for aid in wire[2]})
+    async def run():
+        try:
+            result = await post(path, stream=True)
+            assert result.status_code == 200
+            assert not affinity.get_store(wire[0]).active
+            assert len(wire[3]) == (3 if upstream_error else 1)
+        finally:
+            for stream in held:
+                await stream.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('path', ['chat', 'responses'])
+def test_started_stream_close_propagates_to_pin_without_gc(wire, monkeypatch, path):
+    held = []
+    original = proxy._leased_stream
+    def retain(stream, lease):
+        result = original(stream, lease)
+        held.append(result)
+        return result
+    monkeypatch.setattr(proxy, '_leased_stream', retain)
+    async def run():
+        body = {'model': 'auto', 'stream': True}
+        body.update({'input': 'hello'} if path == 'responses' else {'messages': [{'role': 'user', 'content': 'hello'}]})
+        key = db.get_api_key_by_key('synthetic-caller')
+        bound = router.bind_http(body, key)
+        call = router.responses_after_bind if path == 'responses' else router.chat_after_bind
+        kind, stream = await call(bound, body, key, affinity=ident(wire[1]))
+        assert kind == 'stream'
+        try:
+            async for chunk in stream:
+                text = chunk.decode() if isinstance(chunk, bytes) else chunk
+                if '"ok"' in text:
+                    assert affinity.get_store(wire[0]).active
+                    break
+            else:
+                pytest.fail('Mock content was not streamed')
+            await stream.aclose()
+            assert not affinity.get_store(wire[0]).active
+        finally:
+            await stream.aclose()
+            for source in held:
+                await source.aclose()
+    asyncio.run(run())

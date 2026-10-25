@@ -13,7 +13,7 @@ python tests/offline_runner.py -q -k 'not test_repeated_start_and_restart'
 git diff --check
 ```
 
-第一条核心门禁：**61 passed / 0 failed / 0 skipped**。完整隔离回归已在仅含待提交内容的独立副本执行；CI保留必需检查名`test suite`，使用相同离线入口，不跳过批准流程。
+初次本地核心门禁为61项通过，后续CI发现并修复流关闭缺陷；该初次数字不作为最终验收。完整隔离回归已在仅含待提交内容的独立副本执行；CI保留必需检查名`test suite`，使用相同离线入口，不跳过批准流程。
 
 | 验收目标 | 直接测试证据 |
 |---|---|
@@ -24,10 +24,15 @@ git diff --check
 | 预检查、模型目录及预览不修改绑定 | `test_noninference_never_touches_binding` |
 | 并发首次绑定、迁移、迟到成功/失败、取消、容量与存储故障 | `test_atomic_first_bind_and_restart`；`test_concurrent_asgi_first_requests`；`test_real_concurrent_migration_late_result_cannot_restore_old_binding`；`test_cancellation_during_lease_acquisition_does_not_leak_pin`；状态/存储故障测试 |
 | 上游/响应/错误/日志/调试不泄漏身份，secret隐藏 | `test_direct_actual_chain_preserves_binding_and_no_leaks`；`test_invalid_identity_before_precheck_or_quota`；`test_debug_redaction_including_native_cache_hints`；`test_secret_hidden_and_minimal_browser_cors` |
+| 完成/上游错误结束、已开始流关闭，不依赖GC释放pin | `test_completed_response_releases_pin_without_generator_gc`；`test_started_stream_close_propagates_to_pin_without_gc` |
 | 真实HTTP服务启动→绑定→停止→重启→恢复原账号与generation | `test_isolated_service_start_bind_stop_restart_and_lifecycle`，实际server.main/lifespan，临时SQLite与7个合成账号 |
 | 账号/Key删除、namespace变化、持久TTL边界 | 同一生命周期测试；`test_secret_change_and_caller_scope` |
 
-完整隔离回归：**628 passed / 0 failed / 0 skipped / 1 deselected**，109.22秒。compileall与git diff --check通过。61项核心门禁用时50.34秒；本轮没有发现需修改生产逻辑的核心缺陷，新增改动集中于生命周期覆盖、隔离Mock目的地、CI入口及产品文档。旧645项包含本地客户端/代理探针，本轮独立核心提交不包含这些探针，因此不可直接用总数比较覆盖强弱。
+初次本地完整隔离回归628项通过、1项排除；但PR首次Python 3.12 CI为627通过、1失败、1排除，因此未合并。
+
+根因已用保留迭代器强引用的测试在本地稳定复现：Responses解析器遇到DONE/错误事件提前退出，没有显式关闭下层Chat流；活动绑定引用依赖异步生成器垃圾回收时点。最小修复在Responses、上下文预算包装、模型回写包装中传递aclose，lease释放使用嵌套finally；没有改变选号、重试上限或输出内容。新增跨协议正常/错误结束及已开始流显式关闭回归，断言不借助GC释放pin。修复后核心门禁 **67 passed / 0 failed / 0 skipped**（56.57秒）；完整隔离回归 **634 passed / 0 failed / 0 skipped / 1 deselected**（104.75秒），compileall与diff检查通过。最终以这两组结果及更新后PR CI为准。
+
+旧645项包含本地客户端/代理探针，本轮独立核心提交不包含这些探针，不能直接用总数比较覆盖强弱。
 
 ## 生命周期与隔离说明
 

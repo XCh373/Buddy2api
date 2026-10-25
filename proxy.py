@@ -778,8 +778,10 @@ async def _leased_stream(stream, lease):
         async for chunk in stream:
             yield chunk
     finally:
-        await stream.aclose()
-        await run_in_threadpool(lease.close)
+        try:
+            await stream.aclose()
+        finally:
+            await run_in_threadpool(lease.close)
 
 
 async def _recheck_first(account, info, provider):
