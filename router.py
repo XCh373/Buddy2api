@@ -380,31 +380,37 @@ def _rewrite_json_model(obj, original: str):
 
 
 async def _rewrite_stream_model(stream, original: str):
-    async for chunk in stream:
-        if not isinstance(chunk, (bytes, bytearray, str)):
-            yield chunk
-            continue
-        text = chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else chunk
-        rewritten = []
-        for line in text.splitlines(keepends=True):
-            raw = line[:-1] if line.endswith("\n") else line
-            ended = line.endswith("\n")
-            if raw.startswith("data:") and raw[5:].strip() not in {"", "[DONE]"}:
-                data = raw[5:]
-                if data.startswith(" "):
-                    data = data[1:]
-                try:
-                    parsed = json.loads(data)
-                except json.JSONDecodeError:
+    try:
+        async for chunk in stream:
+            if not isinstance(chunk, (bytes, bytearray, str)):
+                yield chunk
+                continue
+            text = chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else chunk
+            rewritten = []
+            for line in text.splitlines(keepends=True):
+                raw = line[:-1] if line.endswith("\n") else line
+                ended = line.endswith("\n")
+                if raw.startswith("data:") and raw[5:].strip() not in {"", "[DONE]"}:
+                    data = raw[5:]
+                    if data.startswith(" "):
+                        data = data[1:]
+                    try:
+                        parsed = json.loads(data)
+                    except json.JSONDecodeError:
+                        rewritten.append(line)
+                        continue
+                    parsed = _rewrite_json_model(parsed, original)
+                    new_line = "data: " + json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                    rewritten.append(new_line + ("\n" if ended else ""))
+                else:
                     rewritten.append(line)
-                    continue
-                parsed = _rewrite_json_model(parsed, original)
-                new_line = "data: " + json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-                rewritten.append(new_line + ("\n" if ended else ""))
-            else:
-                rewritten.append(line)
-        out = "".join(rewritten)
-        yield out.encode("utf-8") if isinstance(chunk, (bytes, bytearray)) else out
+            out = "".join(rewritten)
+            yield out.encode("utf-8") if isinstance(chunk, (bytes, bytearray)) else out
+
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 async def echo_original(result: tuple, original: str) -> tuple:
