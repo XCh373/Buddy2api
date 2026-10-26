@@ -1,5 +1,6 @@
 services:
   buddy2api:
+    # Build this fork: upstream images do not include fork-specific features.
     build: .
     container_name: buddy2api
     ports:

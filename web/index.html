@@ -1133,7 +1133,7 @@ createApp({
       </template>
     </div>
   </div>
-  <div class="callout" style="margin-bottom:12px">「一键续期并领取」会先续期登录，再领取今日积分。「一键领取今日积分」只领取。定时执行在设置页，默认关闭。</div>
+  <div class="callout" style="margin-bottom:12px">「一键续期并领取」会先续期登录，再领取今日积分。「一键领取今日积分」只领取。定时执行在设置页，默认关闭。每次结果留在设置页的自动化日志。</div>
   <div class="tbar account-tbar"><div class="account-actions"><div class="action-row"><button class="btn s" @click="load(true)" :disabled="ld||officialRefreshing"><span v-html="I.refresh"></span>{{ld?'刷新中':'刷新列表'}}</button><button class="btn s" @click="refreshAllResources()" :disabled="officialRefreshing||!l.some(a=>a.status==='active')">{{officialRefreshing?'刷新中':'刷新官方额度'}}</button><button class="btn s" @click="loadCheckins(true)" :disabled="checkinLoading">{{checkinLoading?'读取中':'刷新领取状态'}}</button></div><div class="action-row"><button class="btn s soft" @click="keepaliveAll" :disabled="keeping||claimingAll||!l.some(a=>a.status!=='inactive')">{{keeping?'处理中':'一键续期并领取'}}</button><button class="btn s pri" @click="claimAll" :disabled="claimingAll||keeping||!l.some(a=>a.status==='active')">{{claimingAll?'领取中':'一键领取今日积分'}}</button><button class="btn s" @click="sa=true"><span v-html="I.plus"></span>高级手动添加</button></div></div><div class="account-tbar-meta"><span class="tag" v-if="checkinSummary">可领 {{checkinSummary.available}} · 已领 {{checkinSummary.already_claimed}}</span><span class="tag" v-if="l.length">{{visibleAccounts.length}}/{{l.length}}个 · {{l.filter(a=>a.status==='active').length}}活跃</span></div></div>
   <div v-if="ld" class="load"><div class="spin"></div></div>
   <div class="card" v-else-if="l.length"><div class="card-h">账号列表<span class="sub">同一列按通道单位展示；到期包仅 WorkBuddy</span></div><div class="card-p" style="padding-bottom:0"><div class="control-row"><input class="searchbox" v-model="filters.q" placeholder="搜索账号 / UID / 域名"/><select class="selectctl" v-model="filters.status"><option value="all">全部状态</option><option value="active">active</option><option value="inactive">inactive</option><option value="expired">expired</option></select><select class="selectctl" v-model="filters.claim"><option value="all">全部领取状态</option><option value="available">可领取</option><option value="claimed">今日已领</option><option value="failed">领取失败</option></select><select class="selectctl" v-model="filters.sort"><option value="priority">优先级 / 权重</option><option value="balance">官方余额高到低</option><option value="expire">最近到期优先</option><option value="requests">请求数高到低</option><option value="used">累计已用高到低</option></select><div class="spacer"></div><span class="tag">当前 {{visibleAccounts.length}} 条</span></div></div><div class="table-scroll"><table><thead><tr><th>账号</th><th>通道</th><th>UID</th><th>状态</th><th>今日领取</th><th>权重</th><th>优先级</th><th>官方余额</th><th>即将到期</th><th>本地估算</th><th>本地快照</th><th>Token 有效期</th><th>请求</th><th>Token</th><th>累计已用</th><th class="ops-head"></th></tr></thead><tbody>
@@ -1155,7 +1155,7 @@ createApp({
   <div class="ov" v-if="sa" @click.self="sa=false"><div class="modal"><div class="modal-h"><h3>高级手动添加</h3><button class="x" @click="sa=false">&times;</button></div><div class="modal-b"><div class="field"><label>名称</label><input v-model="nm" placeholder="可选"/></div><div class="field"><label>Auth JSON</label><textarea v-model="ai" placeholder="粘贴 .info 文件内容"></textarea><div class="hint">只有自动检测失败时才需要手动粘贴完整 JSON。</div></div></div><div class="modal-f"><button class="btn" @click="sa=false" :disabled="adding">取消</button><button class="btn pri" @click="add" :disabled="adding">{{adding?'添加中':'添加'}}</button></div></div></div>
 </div>`
 }).component('keys',{props:['token','toast'],setup(p){
-  const l=ref([]),ld=ref(true),sa=ref(false),df=ref(null),f=reactive({name:'',models:'',limit:null,domain:'',channel:'workbuddy'}),res=ref(''),saving=ref(false),copied=ref(false),busy=ref({}),shown=ref({}),channels=ref([{id:'workbuddy',display_name:'WorkBuddy 国内版'},{id:'workbuddy-i',display_name:'WorkBuddy 国际版'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'qoder',display_name:'Qoder 中国版'},{id:'qoder-i',display_name:'Qoder 国际版'},{id:'traework',display_name:'TraeWork'},{id:'loomy',display_name:'Loomy'},{id:'xiaohuanxiong',display_name:'小浣熊'}]);
+  const l=ref([]),ld=ref(true),sa=ref(false),df=ref(null),f=reactive({name:'',models:'',limit:null,domain:'',channel:'*'}),res=ref(''),saving=ref(false),copied=ref(false),busy=ref({}),shown=ref({}),channels=ref([{id:'workbuddy',display_name:'WorkBuddy 国内版'},{id:'workbuddy-i',display_name:'WorkBuddy 国际版'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'qoder',display_name:'Qoder 中国版'},{id:'qoder-i',display_name:'Qoder 国际版'},{id:'traework',display_name:'TraeWork'},{id:'loomy',display_name:'Loomy'},{id:'xiaohuanxiong',display_name:'小浣熊'}]);
   const anyChannel={id:'*',display_name:'自动通道'};
   function channelOptions(){const rest=channels.value.filter(c=>c.id!=='*');return [anyChannel].concat(rest)}
   function busyKey(id,k){return busy.value[id+'-'+k]}
@@ -1169,7 +1169,7 @@ createApp({
   function cp(v){navigator.clipboard.writeText(v);copied.value=true;p.toast('已复制','info');setTimeout(()=>copied.value=false,1500)}
   function toggleKey(k){shown.value={...shown.value,[k.id]:!shown.value[k.id]}}
   function tok(v){v=Number(v||0);if(v>=1e9)return (v/1e9).toFixed(v>=1e10?1:2).replace(/\.?0+$/,'')+'B';if(v>=1e6)return (v/1e6).toFixed(v>=1e7?1:2).replace(/\.?0+$/,'')+'M';return v.toLocaleString()}
-  function close(){sa.value=false;res.value='';f.name='';f.models='';f.limit=null;f.channel='workbuddy'}
+  function close(){sa.value=false;res.value='';f.name='';f.models='';f.limit=null;f.channel='*'}
   const legacyKeys=computed(()=>l.value.filter(k=>k.client_type==='codex'))
   const updatingLegacy=ref(false)
   async function updateLegacyKeys(){
@@ -1392,9 +1392,11 @@ createApp({
     generic:{name:'通用 OpenAI Compatible',base:'http://127.0.0.1:8787/v1',model:'auto',note:'支持 /v1/chat/completions、/v1/responses 和 /v1/models；Base URL 填写到 /v1。'},
     curl:{name:'curl',base:'http://127.0.0.1:8787/v1',model:'auto',note:'用于快速验证服务、Key 和模型映射是否正常。'},
   };
-  async function load(){ld.value=true;try{const cfg=await api.get('/admin/settings',p.token);s.value={...defaults,...cfg};stats.value=await api.get('/admin/stats',p.token);keysList.value=await api.get('/admin/api-keys',p.token);if(keysList.value.length&&!codexKeyInput.value)codexKeyInput.value=keysList.value.find(k=>k.key)?.key||'';try{codexStatus.value=await api.get('/admin/codex/status',p.token)}catch(e){}}catch(e){p.toast(apiErr(e,'加载失败'),'err')}ld.value=false}
+  const automationLogs=ref([]),automationLatest=ref([]),automationFilter=ref('failed'),automationLoading=ref(false);async function loadAutomation(){automationLoading.value=true;try{const r=await api.get('/admin/automation-logs?limit=200&failures_only='+(automationFilter.value==='failed'?1:0),p.token);automationLogs.value=r.items||[];automationLatest.value=r.latest||[]}catch(e){p.toast(apiErr(e,'自动化日志加载失败'),'err')}automationLoading.value=false}function automationTime(t){return t?new Date(t*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'-'}function automationText(x){return {source:{schedule:'定时',manual:'手动'}[x.source]||x.source||'-',job:{checkin:'领取',keepalive:'续期'}[x.job]||x.job||'-',outcome:{failed:'失败',error:'异常',claimed:'已领取',already:'今日已领',no_campaign:'无活动',refreshed:'已续期',skipped:'跳过',ok:'成功'}[x.outcome]||x.outcome||'-'}}function automationClass(x){if(x.outcome==='failed'||x.outcome==='error')return 'err';if(x.outcome==='skipped'||x.outcome==='no_campaign')return 'warn';return 'ok'}function latestText(job){const row=(automationLatest.value||[]).find(x=>x.job===job&&x.source==='schedule');if(!row)return '还没有定时记录';return automationTime(row.created_at)+' · '+row.total+' 个账号 · 失败 '+(row.failed||0)}
+  async function load(){ld.value=true;try{const cfg=await api.get('/admin/settings',p.token);s.value={...defaults,...cfg};stats.value=await api.get('/admin/stats',p.token);keysList.value=await api.get('/admin/api-keys',p.token);if(keysList.value.length&&!codexKeyInput.value)codexKeyInput.value=keysList.value.find(k=>k.key)?.key||'';try{codexStatus.value=await api.get('/admin/codex/status',p.token)}catch(e){}}catch(e){p.toast(apiErr(e,'加载失败'),'err')}await loadAutomation();ld.value=false}
   async function save(){if(saving.value)return;saving.value=true;try{await api.put('/admin/settings',{backend_url:s.value.backend_url,default_domain:s.value.default_domain,timeout:Number(s.value.timeout)||300,keepalive_enabled:!!s.value.keepalive_enabled,keepalive_hour:Number(s.value.keepalive_hour),auto_checkin_enabled:!!s.value.auto_checkin_enabled,auto_checkin_hour:Number(s.value.auto_checkin_hour),loomy_context_budget:(s.value.loomy_context_budget===0||s.value.loomy_context_budget==='0')?0:(Number(s.value.loomy_context_budget)||160000),workbuddy_routing:s.value.workbuddy_routing},p.token);routePreview.value=null;p.toast('已保存，定时任务和路由策略按新设置生效')}catch(e){p.toast(apiErr(e,'保存失败'),'err')}saving.value=false}
   function resetDefaults(){s.value={...s.value,backend_url:defaults.backend_url,default_domain:defaults.default_domain,timeout:defaults.timeout,keepalive_enabled:false,keepalive_hour:22,auto_checkin_enabled:false,auto_checkin_hour:9,loomy_context_budget:160000,workbuddy_routing:{...routingDefaults}};p.toast('已恢复默认，记得保存','info')}
+
   function saveAdminToken(){p.saveToken(adminToken.value)}
   function clearAdminToken(){adminToken.value='';p.saveToken('')}
   async function codexSetup(){
@@ -1424,7 +1426,8 @@ createApp({
     }
     const x=currentPreset.value;return `curl ${x.base}/chat/completions \\\n  -H "Authorization: Bearer YOUR_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${x.model}","messages":[{"role":"user","content":"hi"}]}'`
   }
-  onMounted(load);return{localMode,s,stats,ld,saving,copied,setupTab,adminToken,presets,currentPreset,envBlock,curlBlock,load,save,resetDefaults,saveAdminToken,clearAdminToken,copy,n,I,keysList,codexKeyInput,codexStatus,codexBusy,codexResult,codexSetup,routePreview,routeBusy,routeReasons,routingTime,previewRouting}
+  onMounted(load);return{localMode,s,stats,ld,saving,copied,setupTab,adminToken,presets,currentPreset,envBlock,curlBlock,load,save,resetDefaults,saveAdminToken,clearAdminToken,copy,n,I,keysList,codexKeyInput,codexStatus,codexBusy,codexResult,codexSetup,routePreview,routeBusy,routeReasons,routingTime,previewRouting,automationLogs,automationFilter,automationLoading,loadAutomation,automationTime,automationText,automationClass,latestText}
+
 },template:`
 <div>
   <div class="phead"><h1>设置</h1><p>运行配置、接入信息和本机维护</p></div>
@@ -1434,12 +1437,35 @@ createApp({
     <div class="card">
       <div class="card-h">自动化<span class="sub">默认关闭 · 保存后才生效</span><span class="tag warn">手动开启</span></div>
       <div class="card-p">
-        <div class="callout" style="margin-bottom:12px">账号页的「一键续期并领取」和「一键领取今日积分」随时可点，不依赖这里。打开下面的开关并保存后，才会在设定的小时自动执行。服务启动时不会自动跑。</div>
+        <div class="callout" style="margin-bottom:12px">账号页的「一键续期并领取」和「一键领取今日积分」随时可点，不依赖这里。打开下面的开关并保存后，才会在设定的小时自动执行。服务启动时不会自动跑。失败账号和原因留在下方日志，保留 30 天，不保存登录凭据。</div>
         <div class="form-grid">
           <div class="field"><label>定时续期</label><select :value="s.keepalive_enabled?'on':'off'" @change="s.keepalive_enabled=$event.target.value==='on'"><option value="off">关闭</option><option value="on">开启</option></select><div class="hint">到点后续期全部未禁用账号。CB_GATEWAY_KEEPALIVE=1 可强制开启，=0 强制关闭。</div></div>
           <div class="field"><label>续期时刻</label><input v-model.number="s.keepalive_hour" type="number" min="0" max="23" placeholder="22"/><div class="hint">本地时间的小时，默认 22。只在该小时的前 10 分钟执行一次。</div></div>
           <div class="field"><label>定时领取积分</label><select :value="s.auto_checkin_enabled?'on':'off'" @change="s.auto_checkin_enabled=$event.target.value==='on'"><option value="off">关闭</option><option value="on">开启</option></select><div class="hint">到点后领取支持签到的通道。CB_GATEWAY_AUTO_CHECKIN=1 可强制开启，=0 强制关闭。</div></div>
           <div class="field"><label>领取时刻</label><input v-model.number="s.auto_checkin_hour" type="number" min="0" max="23" placeholder="9"/><div class="hint">本地时间的小时，默认 9。只在该小时的前 10 分钟执行一次。</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h">自动化日志<span class="sub">保留 30 天 · 不保存登录凭据</span></div>
+      <div class="card-p">
+        <div class="control-row">
+          <select class="selectctl" v-model="automationFilter" @change="loadAutomation"><option value="failed">仅失败</option><option value="all">全部</option></select>
+          <button class="btn s" @click="loadAutomation" :disabled="automationLoading">{{automationLoading?'读取中':'刷新日志'}}</button>
+          <span class="tag">{{automationLogs.length}} 条</span>
+        </div>
+        <div class="hint" style="margin-top:8px">最近定时续期：{{latestText('keepalive')}}</div>
+        <div class="hint">最近定时领取：{{latestText('checkin')}}</div>
+      </div>
+      <div class="table-scroll" v-if="automationLogs.length"><table><thead><tr><th>时间</th><th>来源</th><th>任务</th><th>通道</th><th>账号</th><th>结果</th><th>原因</th></tr></thead><tbody>
+        <tr v-for="x in automationLogs" :key="x.id"><td class="mono">{{automationTime(x.created_at)}}</td><td>{{automationText(x).source}}</td><td>{{automationText(x).job}}</td><td><span class="tag">{{x.channel||'-'}}</span></td><td>{{x.account_name||'-'}}</td><td><span class="badge" :class="automationClass(x)">{{automationText(x).outcome}}</span></td><td>{{x.message||'-'}}</td></tr>
+      </tbody></table></div>
+      <div class="card-p empty" v-else><p>{{automationFilter==='failed'?'最近没有失败记录':'暂无自动化日志'}}</p></div>
+    </div>
+    <div class="card">
+      <div class="card-h">上下文预算<span class="sub">只影响 Loomy 发送前裁剪</span></div>
+      <div class="card-p">
+        <div class="form-grid">
           <div class="field"><label>Loomy 上下文预算</label><input v-model.number="s.loomy_context_budget" type="number" min="0" max="2000000" placeholder="160000"/><div class="hint">只在发送前裁 Loomy 的旧对话，默认 160000 token。填 0 关闭发送前裁剪。上游拒绝上下文时仍会再裁一次。CB_LOOMY_CONTEXT_BUDGET 可覆盖。</div></div>
         </div>
       </div>
