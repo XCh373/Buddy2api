@@ -320,10 +320,53 @@ def test_concurrent_asgi_first_requests(wire):
         tasks = [asyncio.create_task(request()) for _ in range(12)]
         gate.set()
         results = await asyncio.gather(*tasks)
-        assert all(r.status_code == 200 for r in results)
+        # A cold store and account-selection locks have a bounded wait. Under
+        # contention a request may fail closed, but must never bypass affinity.
+        succeeded = [r for r in results if r.status_code == 200]
+        assert succeeded, [(r.status_code, r.text) for r in results]
+        assert len(wire[3]) == len(succeeded)
+        for result in results:
+            if result.status_code != 200:
+                assert result.status_code == 503, result.text
+                assert result.json()["error"]["code"] == "affinity_state_unavailable"
+        # Once contention has drained, retrying preserves the single winner.
+        for result in results:
+            if result.status_code != 200:
+                assert (await post()).status_code == 200
     asyncio.run(run())
     assert len(rows()) == 1 and rows()[0]["generation"] == 1
     assert len({r[0] for r in wire[3]}) == 1
+
+
+def test_cold_store_contention_fails_closed_then_recovers(wire, monkeypatch):
+    cfg, caller, aids, captures, failures = wire
+    entered, release = threading.Event(), threading.Event()
+    original = affinity.Store
+
+    def delayed_store(*args, **kwargs):
+        entered.set()
+        assert release.wait(5), "cold-store test release timed out"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(affinity, "Store", delayed_store)
+
+    async def run():
+        initializing = asyncio.create_task(asyncio.to_thread(affinity.get_store, cfg))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            response = await post()
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "affinity_state_unavailable"
+            assert not captures and not rows()
+        finally:
+            release.set()
+            await initializing
+        assert (await post()).status_code == 200
+        assert len(captures) == len(rows()) == 1
+        assert rows()[0]["generation"] == 1
+        assert not affinity.get_store(cfg).active
+
+    asyncio.run(run())
 
 
 def test_real_process_restart_restores_binding_without_network(wire):

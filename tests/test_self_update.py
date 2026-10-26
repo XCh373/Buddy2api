@@ -108,6 +108,7 @@ def test_github_contents_parser_rejects_malformed_payloads(payload):
 
 
 def test_forced_check_rate_limit_falls_back_to_overridden_repo_raw(monkeypatch):
+    monkeypatch.setattr(self_update, "VERSION", "2.2.5")
     monkeypatch.setenv("CB_GATEWAY_UPDATE_REPO", "example/fork")
     requested = []
 
@@ -205,6 +206,7 @@ def test_get_keeps_four_second_timeout(monkeypatch):
 
 
 def test_forced_version_check_does_not_run_git_or_restart(monkeypatch):
+    monkeypatch.setattr(self_update, "VERSION", "2.2.5")
     content = base64.b64encode(b'VERSION = "2.2.6"\n').decode()
 
     async def fake_get(url):
@@ -277,7 +279,7 @@ def test_docker_install_cannot_apply(monkeypatch):
     payload = asyncio.run(self_update.check(force=True))
     assert payload["update_available"] is True
     assert payload["can_apply"] is False
-    assert "Docker" in payload["message"]
+    assert payload["message"] == "Docker 部署请在宿主机更新本 fork 源码后运行 docker compose up -d --build"
 
 
 def test_apply_pulls_installs_and_asks_restart(monkeypatch, tmp_path):

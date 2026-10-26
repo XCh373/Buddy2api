@@ -1003,7 +1003,7 @@ async def admin_claim_all_checkin(
         not isinstance(channels, list) or not all(isinstance(item, str) for item in channels)
     ):
         raise HTTPException(status_code=400, detail="channels must be an array of strings")
-    return await control_plane.checkin_all(channels)
+    return await control_plane.checkin_all(channels, source="manual")
 
 
 @app.post("/admin/accounts/keepalive-all")
@@ -1155,6 +1155,19 @@ async def admin_apply_update(authorization: str | None = Header(default=None)):
     if result.get("restart"):
         self_update.schedule_restart()
     return result
+
+
+@app.get("/admin/automation-logs")
+async def admin_automation_logs(
+    limit: int = 100,
+    failures_only: int = 0,
+    authorization: str | None = Header(default=None),
+):
+    _check_admin(authorization)
+    return {
+        "items": db.list_automation_events(limit=limit, failures_only=bool(failures_only)),
+        "latest": db.latest_automation_runs(),
+    }
 
 
 @app.get("/admin/settings")

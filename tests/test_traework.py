@@ -547,6 +547,24 @@ def test_traework_auth_dirs_ignore_workbuddy_cb_auth_dir(monkeypatch, tmp_path):
     assert wb.resolve() not in dirs
 
 
+def test_traework_auth_dirs_include_newer_trae_cn(monkeypatch, tmp_path):
+    monkeypatch.delenv("CB_TRAEWORK_AUTH_DIR", raising=False)
+    monkeypatch.delenv("CB_TRAEWORK_USER_DATA_DIR", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    dirs = traework_auth_dirs()
+    assert tmp_path / "TRAE SOLO CN" / "User" / "globalStorage" in dirs
+    assert tmp_path / "Trae CN" / "User" / "globalStorage" in dirs
+
+
+def test_traework_user_data_override_does_not_add_default_dirs(monkeypatch, tmp_path):
+    custom = tmp_path / "custom-trae"
+    monkeypatch.setenv("CB_TRAEWORK_USER_DATA_DIR", str(custom))
+    monkeypatch.delenv("CB_TRAEWORK_AUTH_DIR", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
+    dirs = traework_auth_dirs()
+    assert dirs == [custom / "User" / "globalStorage"]
+
+
 def test_decrypt_tc_roundtrip_rejects_garbage():
     with pytest.raises(Exception):
         decrypt_tc_b64("not-base64-$$$")

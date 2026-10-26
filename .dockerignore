@@ -36,3 +36,4 @@ _mimo-backup-*/
 *.har
 *.pcap
 *.pcapng
+docker-compose.override.yml

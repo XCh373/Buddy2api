@@ -48,6 +48,10 @@ _REWRITES = (
         "Sisyphus-Junior - Focused executor from OhMyOpenCode",
         "Sisyphus-Junior - Focused executor from Oh My OpenCode",
     ),
+    (
+        "You are an AI agent powered by DeepSeek Harness.",
+        "You are an AI agent powered by DeepSeek's Harness.",
+    ),
     ("11128", "11-128"),
 )
 _NEEDLES = (
@@ -56,6 +60,7 @@ _NEEDLES = (
     "You are Claude Code",
     "Main branch (",
     "You are a coding agent running in the Codex CLI",
+    "You are an AI agent powered by DeepSeek Harness",
     "github.com/anthropics/",
     "OhMyOpenCode",
     "11128",

@@ -10,6 +10,7 @@ database.py — SQLite 数据层
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -433,6 +434,28 @@ def init_db():
 
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS automation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                job TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                account_id INTEGER,
+                account_name TEXT,
+                channel TEXT,
+                outcome TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                status_code INTEGER,
+                message TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_events_created ON automation_events(created_at)"
+        )
+        _prune_automation_events(conn)
         _prune_logs(conn)
         conn.execute("PRAGMA optimize")
         conn.commit()
@@ -1259,6 +1282,142 @@ def prune_logs(retention_days: int | None = None) -> int:
             conn.execute("DELETE FROM api_key_daily_usage WHERE usage_date < ?", (cutoff_date,))
             conn.commit()
             return max(0, cursor.rowcount)
+
+
+def _prune_automation_events(conn: sqlite3.Connection) -> None:
+    cutoff = int(time.time()) - 30 * 86400
+    conn.execute("DELETE FROM automation_events WHERE created_at < ?", (cutoff,))
+    conn.execute(
+        """
+        DELETE FROM automation_events
+        WHERE id NOT IN (
+            SELECT id FROM automation_events ORDER BY id DESC LIMIT 2000
+        )
+        """
+    )
+
+
+def public_automation_text(value, limit: int = 240) -> str:
+    """Return a log-safe message. Never keep header values or opaque credentials."""
+    text = " ".join(str(value or "").split())
+    text = re.sub(
+        r"(?i)\b(?:authorization\s*[:=]\s*)?(?:bearer|cloud-ide-jwt)\s+\S+",
+        "[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)\b(?:authorization|cookie)\s*[:=]\s*\S+", "[redacted]", text)
+    text = re.sub(
+        r"(?i)((?:access_token|refresh_token|password|session_state)[\"']?\s*[:=]\s*[\"']?)\S+",
+        r"\1[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:access_token|refresh_token|token|code)=)[^&\s]+",
+        r"\1[redacted]",
+        text,
+    )
+    text = re.sub(r"\beyJ[A-Za-z0-9_\-]{8,}(?:\.[A-Za-z0-9_\-]+){1,}", "[redacted]", text)
+    text = re.sub(r"\b[A-Za-z0-9_\-]{32,}\b", "[redacted]", text)
+    return text[:limit]
+
+
+def add_automation_events(events: list[dict]) -> None:
+    """Store public automation results. Credential-shaped text is redacted again."""
+    if not events:
+        return
+    now = int(time.time())
+    rows = []
+    for event in events:
+        account_id = event.get("account_id")
+        try:
+            account_id = int(account_id) if account_id not in (None, "") else None
+        except (TypeError, ValueError):
+            account_id = None
+        status_code = event.get("status_code")
+        try:
+            status_code = int(status_code) if status_code not in (None, "") else None
+        except (TypeError, ValueError):
+            status_code = None
+        rows.append(
+            (
+                int(event.get("created_at") or now),
+                str(event.get("source") or "manual")[:32],
+                str(event.get("job") or "")[:32],
+                str(event.get("run_id") or "")[:32],
+                account_id,
+                public_automation_text(event.get("account_name") or "", 80),
+                public_automation_text(event.get("channel") or "", 32),
+                str(event.get("outcome") or "failed")[:32],
+                1 if event.get("ok") else 0,
+                status_code,
+                public_automation_text(event.get("message") or ""),
+            )
+        )
+    with _lock:
+        conn = get_conn()
+        conn.executemany(
+            """
+            INSERT INTO automation_events
+                (created_at, source, job, run_id, account_id, account_name,
+                 channel, outcome, ok, status_code, message)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+        _prune_automation_events(conn)
+        conn.commit()
+        conn.close()
+
+
+def list_automation_events(limit: int = 100, failures_only: bool = False) -> list[dict]:
+    limit = max(1, min(200, int(limit or 100)))
+    sql = """
+        SELECT id, created_at, source, job, run_id, account_id, account_name,
+               channel, outcome, ok, status_code, message
+        FROM automation_events
+    """
+    if failures_only:
+        sql += " WHERE outcome IN ('failed', 'error')"
+    sql += " ORDER BY id DESC LIMIT ?"
+    conn = get_conn()
+    rows = conn.execute(sql, (limit,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def latest_automation_runs() -> list[dict]:
+    conn = get_conn()
+    anchors = conn.execute(
+        """
+        SELECT source, job, run_id, created_at
+        FROM automation_events
+        WHERE id IN (SELECT MAX(id) FROM automation_events GROUP BY source, job)
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    latest = []
+    for anchor in anchors:
+        stats = conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN outcome IN ('failed', 'error') THEN 1 ELSE 0 END) AS failed
+            FROM automation_events
+            WHERE run_id=?
+            """,
+            (anchor["run_id"],),
+        ).fetchone()
+        latest.append(
+            {
+                "source": anchor["source"],
+                "job": anchor["job"],
+                "run_id": anchor["run_id"],
+                "created_at": int(anchor["created_at"] or 0),
+                "total": int(stats["total"] or 0),
+                "failed": int(stats["failed"] or 0),
+            }
+        )
+    conn.close()
+    return latest
 
 
 def list_logs(limit: int = 100, offset: int = 0) -> list[dict]:

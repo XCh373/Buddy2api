@@ -633,7 +633,98 @@ async def checkin_status_all(force: bool = False) -> dict:
     }
 
 
-async def checkin_all(channel_filter: list[str] | None = None) -> dict:
+def _public_text(value, limit: int = 240) -> str:
+    return db.public_automation_text(value, limit)
+
+
+def _event_parts(row: dict) -> tuple[int | None, str, str, int | None]:
+    raw_id = row.get("account_id")
+    try:
+        account_id = int(raw_id) if raw_id not in (None, "") else None
+    except (TypeError, ValueError):
+        account_id = None
+    raw_status = row.get("status_code")
+    try:
+        status_code = int(raw_status) if raw_status not in (None, "") else None
+    except (TypeError, ValueError):
+        status_code = None
+    name = _public_text(row.get("account_name") or row.get("nickname") or row.get("name") or "", 80)
+    channel = _public_text(row.get("channel") or row.get("provider") or "", 32)
+    return account_id, name, channel, status_code
+
+
+def _checkin_outcome(row: dict) -> str:
+    if row.get("skipped"):
+        return "skipped"
+    if not row.get("ok"):
+        return "failed"
+    if row.get("claimed"):
+        return "claimed"
+    if row.get("already_claimed") or row.get("today_checked_in"):
+        return "already"
+    if row.get("no_campaign"):
+        return "no_campaign"
+    return "ok"
+
+
+def _keepalive_outcome(row: dict) -> str:
+    if row.get("skipped"):
+        return "skipped"
+    if row.get("ok"):
+        return "refreshed"
+    return "failed"
+
+
+def _record_automation(job: str, source: str, rows: list[dict], outcome_for) -> None:
+    run_id = secrets.token_hex(8)
+    now = int(time.time())
+    events = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        account_id, name, channel, status_code = _event_parts(row)
+        outcome = outcome_for(row)
+        message = _public_text(row.get("message") or "")
+        events.append(
+            {
+                "created_at": now,
+                "source": source or "manual",
+                "job": job,
+                "run_id": run_id,
+                "account_id": account_id,
+                "account_name": name,
+                "channel": channel,
+                "outcome": outcome,
+                "ok": outcome in {"refreshed", "claimed", "already", "ok"},
+                "status_code": status_code,
+                "message": message,
+            }
+        )
+        if outcome in {"failed", "error"}:
+            sys.stderr.write(
+                f"[{job}] failed source={source or 'manual'} channel={channel or '-'} "
+                f"account={name or '-'} status={status_code or 0} message={message or '-'}\n"
+            )
+    if not events:
+        return
+    try:
+        db.add_automation_events(events)
+    except Exception as exc:
+        sys.stderr.write(f"[{job}] log failed: {type(exc).__name__}\n")
+
+
+def record_automation_error(job: str, source: str, exc: Exception) -> None:
+    message = _public_text(exc) or type(exc).__name__
+    _record_automation(
+        job,
+        source,
+        [{"ok": False, "message": message, "outcome_error": True}],
+        lambda _row: "error",
+    )
+    sys.stderr.write(f"[{job}] {source} failed: {type(exc).__name__}\n")
+
+
+async def checkin_all(channel_filter: list[str] | None = None, source: str = "manual") -> dict:
     wanted = set(channel_filter) if channel_filter else None
     results = []
     gap = checkin_gap_seconds()
@@ -653,9 +744,26 @@ async def checkin_all(channel_filter: list[str] | None = None) -> dict:
             if not first and gap:
                 await asyncio.sleep(gap)
             first = False
-            result = await claim_one(account)
+            try:
+                result = await claim_one(account)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "account_id": account.get("id"),
+                    "account_name": _account_label(account),
+                    "status_code": 0,
+                    "message": _public_text(exc) or type(exc).__name__,
+                }
+            if not isinstance(result, dict):
+                result = {
+                    "ok": False,
+                    "account_id": account.get("id"),
+                    "account_name": _account_label(account),
+                    "message": "领取结果无效",
+                }
             result["channel"] = channel
             results.append(result)
+    _record_automation("checkin", source, results, _checkin_outcome)
     wb_credit = round(
         sum(float(row.get("credit") or 0) for row in results if row.get("claimed") and row.get("channel") == "workbuddy"),
         4,
@@ -761,6 +869,12 @@ async def keepalive_all(
 ) -> dict:
     busy = await _begin_job(source)
     if busy:
+        _record_automation(
+            "keepalive",
+            source,
+            [{"ok": False, "message": "已有保活或领取任务在进行，本次未执行"}],
+            _keepalive_outcome,
+        )
         return busy
     try:
         wanted = set(channel_filter) if channel_filter else None
@@ -775,16 +889,34 @@ async def keepalive_all(
                 if not first and gap:
                     await asyncio.sleep(gap)
                 first = False
-                result = await refresh_one(account, allow_inactive=False)
+                try:
+                    result = await refresh_one(account, allow_inactive=False)
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "account_id": account.get("id"),
+                        "account_name": _account_label(account),
+                        "provider": channel,
+                        "status_code": 0,
+                        "message": _public_text(exc) or type(exc).__name__,
+                    }
+                if not isinstance(result, dict):
+                    result = {
+                        "ok": False,
+                        "account_id": account.get("id"),
+                        "account_name": _account_label(account),
+                        "message": "续期结果无效",
+                    }
                 result["channel"] = channel
                 result["status_text"] = "ok" if result.get("ok") else "failed"
                 results.append(result)
         refreshed = sum(1 for row in results if row.get("ok"))
         skipped = sum(1 for row in results if row.get("skipped"))
         failed = sum(1 for row in results if not row.get("ok") and not row.get("skipped"))
+        _record_automation("keepalive", source, results, _keepalive_outcome)
         claim_summary = None
         if claim:
-            claim_summary = await checkin_all(channel_filter)
+            claim_summary = await checkin_all(channel_filter, source=source)
         claim_failed = int((claim_summary or {}).get("failed") or 0)
         claimed = int((claim_summary or {}).get("claimed") or 0)
         already = int((claim_summary or {}).get("already_claimed") or 0)
@@ -828,7 +960,7 @@ async def _run_keepalive_safe(source: str) -> None:
     try:
         _log_keepalive(await keepalive_all(source=source, claim=False))
     except Exception as exc:
-        sys.stderr.write(f"[keepalive] {source} failed: {type(exc).__name__}\n")
+        record_automation_error("keepalive", source, exc)
 
 
 async def _run_checkin_safe(source: str) -> None:
@@ -836,9 +968,15 @@ async def _run_checkin_safe(source: str) -> None:
         return
     busy = await _begin_job(source)
     if busy:
+        _record_automation(
+            "checkin",
+            source,
+            [{"ok": False, "message": "已有保活或领取任务在进行，本次未执行"}],
+            _checkin_outcome,
+        )
         return
     try:
-        summary = await checkin_all()
+        summary = await checkin_all(source=source)
         sys.stderr.write(
             "[checkin] source={source} claimed={claimed} already={already} failed={failed}\n".format(
                 source=source,
@@ -848,7 +986,7 @@ async def _run_checkin_safe(source: str) -> None:
             )
         )
     except Exception as exc:
-        sys.stderr.write(f"[checkin] {source} failed: {type(exc).__name__}\n")
+        record_automation_error("checkin", source, exc)
     finally:
         await _end_job()
 

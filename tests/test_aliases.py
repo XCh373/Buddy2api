@@ -162,3 +162,11 @@ def test_accounts_is_first_nav_and_default_page():
     assert html.find("{k:'accounts'") < html.find("{k:'dashboard'")
     assert "savedPage)?savedPage:'accounts'" in html
     assert "savedPage)?savedPage:'dashboard'" not in html
+
+
+def test_create_key_form_defaults_to_auto_channel():
+    html = (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text(encoding="utf-8")
+    assert "channel:'*'" in html
+    assert "f.channel='*'" in html
+    assert "channel:'workbuddy'}),res" not in html
+    assert "f.channel='workbuddy'" not in html
