@@ -98,6 +98,26 @@ def test_deepseek_backfill_only_when_thinking_or_trace(monkeypatch):
     assert "reasoning_content" not in assistant(other)
 
 
+def test_deepseek_harness_identity_is_rewritten(monkeypatch):
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
+    text = "You are an AI agent powered by DeepSeek Harness.\n\nKeep the task unchanged."
+    changed = _body([{"role": "system", "content": text}])
+    content = changed["messages"][0]["content"]
+    assert "powered by DeepSeek's Harness." in content
+    assert "DeepSeek Harness." not in content
+    assert "Keep the task unchanged." in content
+
+    mention = _body([{"role": "user", "content": "compare DeepSeek Harness with Codex"}])
+    user = next(item for item in mention["messages"] if item["role"] == "user")
+    assert user["content"] == "compare DeepSeek Harness with Codex"
+
+    parts = _body([{
+        "role": "system",
+        "content": [{"type": "text", "text": text}],
+    }])
+    assert "DeepSeek's Harness." in parts["messages"][0]["content"][0]["text"]
+
+
 def test_fingerprint_rewrite_can_be_disabled(monkeypatch):
     monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
     text = "You are Claude Code, Anthropic's official CLI for Claude."

@@ -20,12 +20,15 @@ from providers.traework.constants import (
 from providers.traework.crypto import decrypt_tc_b64, encrypt_tc_b64
 
 
+def _roaming_dir() -> Path:
+    return Path(os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming"))
+
+
 def traework_user_data_dir() -> Path:
     override = os.environ.get("CB_TRAEWORK_USER_DATA_DIR", "").strip()
     if override:
         return Path(override).expanduser()
-    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    return Path(appdata) / "TRAE SOLO CN"
+    return _roaming_dir() / "TRAE SOLO CN"
 
 
 def traework_auth_dirs() -> list[Path]:
@@ -33,7 +36,14 @@ def traework_auth_dirs() -> list[Path]:
     explicit = os.environ.get("CB_TRAEWORK_AUTH_DIR", "").strip()
     if explicit:
         dirs.append(Path(explicit).expanduser())
-    dirs.append(traework_user_data_dir() / "User" / "globalStorage")
+    user_override = os.environ.get("CB_TRAEWORK_USER_DATA_DIR", "").strip()
+    if user_override:
+        dirs.append(Path(user_override).expanduser() / "User" / "globalStorage")
+    else:
+        roaming = _roaming_dir()
+        dirs.append(roaming / "TRAE SOLO CN" / "User" / "globalStorage")
+        # Newer Trae CN installs keep the same storage.json here.
+        dirs.append(roaming / "Trae CN" / "User" / "globalStorage")
     seen: set[str] = set()
     out: list[Path] = []
     for item in dirs:
