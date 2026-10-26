@@ -52,6 +52,7 @@ logs/
 *.log
 
 # Local builds, packages, and exported artifacts
+docker-compose.override.yml
 dist/
 build/
 release/

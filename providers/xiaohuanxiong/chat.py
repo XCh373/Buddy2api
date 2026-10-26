@@ -63,6 +63,17 @@ def _log(api_key_info, account, model_name, stream, prompt_t, completion_t, tota
         pass
 
 
+def _log_failure(api_key_info, account, model_name, stream, status, message, t0, *, final):
+    _log(
+        api_key_info, account, model_name, stream, 0, 0, 0,
+        "error" if final else "retry",
+        status,
+        (message or "")[:400],
+        t0,
+        increment_usage=final,
+    )
+
+
 def _body(payload: dict) -> tuple[dict, str]:
     body = dict(payload)
     body["model"] = translate_model(str(body.get("model") or "auto"))
@@ -100,7 +111,12 @@ async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
                 )
         except (httpx.HTTPError, XiaohuanxiongAuthError) as exc:
             auth_manager.mark_account_failure(account["id"], 503)
-            last_error = ("error", (503, {"error": {"message": str(exc)[:240], "type": "server_error"}}))
+            message = str(exc)[:240]
+            last_error = ("error", (503, {"error": {"message": message, "type": "server_error"}}))
+            final = attempt == 2
+            _log_failure(api_key_info, account, model_name, False, 503, message, t0, final=final)
+            if final:
+                return last_error
             continue
         if response.status_code < 400:
             auth_manager.mark_account_success(account["id"])
@@ -125,8 +141,11 @@ async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
             except XiaohuanxiongAuthError:
                 pass
         auth_manager.mark_account_failure(account["id"], status)
+        text = response.text[:400]
         last_error = ("error", (status, _detail(response)))
-        if status not in RETRYABLE_STATUS:
+        final = status not in RETRYABLE_STATUS or attempt == 2
+        _log_failure(api_key_info, account, model_name, False, status, text, t0, final=final)
+        if final:
             return last_error
     return last_error or (
         "error",
@@ -145,7 +164,7 @@ def _detail(response: httpx.Response) -> dict:
 async def _stream(raw: str, api_key_info, model_name: str) -> AsyncGenerator[bytes, None]:
     tried: set[int] = set()
     last_error = b"data: {\"error\":{\"message\":\"No available accounts\"}}\n\n"
-    for _attempt in range(3):
+    for attempt in range(3):
         account = auth_manager.pick_account(tried, provider=CHANNEL_ID)
         if not account:
             break
@@ -165,23 +184,57 @@ async def _stream(raw: str, api_key_info, model_name: str) -> AsyncGenerator[byt
                         text = (await response.aread()).decode("utf-8", errors="replace")[:400]
                         auth_manager.mark_account_failure(account["id"], response.status_code)
                         last_error = f"data: {json.dumps({'error': {'message': text}}, ensure_ascii=False)}\n\n".encode()
-                        if response.status_code not in RETRYABLE_STATUS:
+                        final = response.status_code not in RETRYABLE_STATUS or attempt == 2
+                        if final:
                             yield last_error
+                            _log_failure(
+                                api_key_info, account, model_name, True,
+                                response.status_code, text, t0, final=True,
+                            )
                             return
+                        _log_failure(
+                            api_key_info, account, model_name, True,
+                            response.status_code, text, t0, final=False,
+                        )
                         continue
                     auth_manager.mark_account_success(account["id"])
+                    usage: dict = {}
+                    finish = "stop"
                     async for line in response.aiter_lines():
                         if line == "":
                             continue
+                        if line.startswith("data:"):
+                            data = line[5:].strip()
+                            if data and data != "[DONE]":
+                                try:
+                                    chunk = json.loads(data)
+                                    if isinstance(chunk, dict):
+                                        if isinstance(chunk.get("usage"), dict):
+                                            usage = chunk["usage"]
+                                        choice = (chunk.get("choices") or [{}])[0]
+                                        if isinstance(choice, dict) and choice.get("finish_reason"):
+                                            finish = choice["finish_reason"]
+                                except json.JSONDecodeError:
+                                    pass
                         started = True
                         yield (line + "\n\n").encode("utf-8")
-            _log(api_key_info, account, model_name, True, 0, 0, 0, "stop", 200, "", t0)
+            prompt_t = int(usage.get("prompt_tokens") or 0)
+            completion_t = int(usage.get("completion_tokens") or 0)
+            total_t = int(usage.get("total_tokens") or (prompt_t + completion_t))
+            _log(api_key_info, account, model_name, True, prompt_t, completion_t, total_t, finish, 200, "", t0)
             return
         except (httpx.HTTPError, XiaohuanxiongAuthError) as exc:
+            message = str(exc)[:240]
             if started:
+                _log_failure(api_key_info, account, model_name, True, 503, message, t0, final=True)
                 return
             auth_manager.mark_account_failure(account["id"], 503)
-            last_error = f"data: {json.dumps({'error': {'message': str(exc)[:240]}}, ensure_ascii=False)}\n\n".encode()
+            last_error = f"data: {json.dumps({'error': {'message': message}}, ensure_ascii=False)}\n\n".encode()
+            final = attempt == 2
+            _log_failure(api_key_info, account, model_name, True, 503, message, t0, final=final)
+            if final:
+                yield last_error
+                return
     yield last_error
 
 

@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import context_budget
 import router
@@ -100,3 +101,14 @@ def test_small_html_error_is_rewritten_without_retry():
     assert result[1][0] == 502
     assert result[1][1]["error"]["code"] == "upstream_html"
     assert "<html>" not in result[1][1]["error"]["message"]
+
+
+def test_settings_keeps_loomy_budget_outside_automation():
+    text = Path("web/index.html").read_text(encoding="utf-8")
+    automation = text.split('<div class="card-h">自动化<span', 1)[1].split('<div class="card-h">自动化日志', 1)[0]
+    assert "loomy_context_budget" not in automation
+    budget = text.split('<div class="card-h">上下文预算', 1)[1].split('<div class="card-h">后端参数', 1)[0]
+    assert 'v-model.number="s.loomy_context_budget"' in budget
+    assert "默认 160000 token" in budget
+    assert "填 0 关闭发送前裁剪" in budget
+    assert "CB_LOOMY_CONTEXT_BUDGET 可覆盖" in budget
