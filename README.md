@@ -303,7 +303,7 @@ QwenWork、TraeWork、Loomy、小浣熊各用自己那把 Key，不要混用。�
 | `CB_QWENWORK_AUTH_DIR` | QwenWork 登录目录 |
 | `CB_TRAEWORK_AUTH_DIR` | TraeWork `storage.json` 所在目录 |
 | `CB_LOOMY_AUTH_DIR` | Loomy 数据根目录，下面应有 `*/userData/auth-session.json` |
-| `CB_LOOMY_CONTEXT_BUDGET` | Loomy 发送前上下文预算，默认 `160000`。`0` 关闭发送前裁剪 |
+| `CB_LOOMY_CONTEXT_BUDGET` | 旧版 Loomy 裁剪预算（兼容保留）。当前不再据此裁剪或拒绝请求，上游超限由客户端处理 |
 | `CB_GATEWAY_MAX_BODY_BYTES` | 请求体上限，默认 `33554432`（32 MiB） |
 | `CB_XHX_AUTH_DIR` | 小浣熊 `auth.json` 所在目录或文件 |
 | `CB_HOST_AUTH_DIR` | Docker 脚本用的本机 WorkBuddy 目录 |

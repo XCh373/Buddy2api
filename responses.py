@@ -149,6 +149,89 @@ def _structured_output_instruction(response_format: dict) -> Optional[str]:
     return "\n".join(parts)
 
 
+class UnsupportedImageInput(ValueError):
+    """The bridge cannot faithfully represent this structured image input."""
+
+
+def _has_image(content) -> bool:
+    if isinstance(content, list):
+        return any(_has_image(part) for part in content)
+    if isinstance(content, dict):
+        if content.get("type") in {"input_image", "image_url"}:
+            return True
+        return any(_has_image(content.get(key)) for key in ("content", "output") if key in content)
+    return False
+
+
+def _reject_image_content(content):
+    """Reject only the image shapes Chat tool messages cannot carry.
+
+    A user message may carry a structured image: Chat Completions accepts
+    ``{"type":"image_url"}`` content parts there, and the bridge forwards them.
+    A tool result may not: the Chat tool message content is text-only, so an
+    image there is refused explicitly instead of being silently flattened.
+    """
+    if isinstance(content, list):
+        for part in content:
+            _reject_image_content(part)
+    elif isinstance(content, dict):
+        if ((content.get("type") == "function_call_output" and _has_image(content.get("output")))
+                or (content.get("role") == "tool" and _has_image(content.get("content")))):
+            raise UnsupportedImageInput(
+                "工具结果中的图片暂不支持透传（Chat 工具消息只接受文本）；请求未发送至上游。"
+            )
+        if content.get("type") in {"input_image", "image_url"}:
+            value = content.get("image_url")
+            url = value.get("url") if isinstance(value, dict) else value
+            if not isinstance(url, str) or not url:
+                raise UnsupportedImageInput("图片输入缺少有效的 image_url。")
+        if "content" in content:
+            _reject_image_content(content["content"])
+        if content.get("type") == "function_call_output":
+            _reject_image_content(content.get("output"))
+
+
+def validate_responses_images(resp_payload: dict) -> None:
+    _reject_image_content(resp_payload.get("input"))
+    _reject_image_content(resp_payload.get("instructions"))
+
+
+# Chat image parts accept only these detail levels. Responses additionally
+# defines "original" (and may grow more), so anything not in this set is mapped
+# to "auto" rather than forwarding an out-of-enum value upstream.
+_CHAT_IMAGE_DETAILS = frozenset({"auto", "low", "high"})
+
+
+def _chat_image_detail(value):
+    """Normalize a Responses image detail to a Chat-supported value."""
+    detail = str(value or "").strip().lower()
+    return detail if detail in _CHAT_IMAGE_DETAILS else "auto"
+
+
+def _chat_content(content):
+    """Preserve structured images for user messages; flatten everything else."""
+    if not isinstance(content, list) or not any(
+        isinstance(part, dict) and part.get("type") in {"input_image", "image_url"}
+        for part in content
+    ):
+        return _flatten_content(content)
+    parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") in {"input_image", "image_url"}:
+            value = part["image_url"]
+            image = dict(value) if isinstance(value, dict) else {"url": value}
+            if "detail" in part:
+                image["detail"] = _chat_image_detail(part["detail"])
+            elif isinstance(value, dict) and "detail" in value:
+                image["detail"] = _chat_image_detail(value["detail"])
+            parts.append({"type": "image_url", "image_url": image})
+        else:
+            text = _flatten_content([part])
+            if text:
+                parts.append({"type": "text", "text": text})
+    return parts
+
+
 def responses_to_chat(resp_payload: dict) -> dict:
     """
     将 Responses API 请求转换为 Chat Completions 请求。
@@ -161,6 +244,7 @@ def responses_to_chat(resp_payload: dict) -> dict:
       model, messages[], tools[], stream, temperature, max_tokens,
       response_format
     """
+    validate_responses_images(resp_payload)
     messages = []
 
     # instructions → system message
@@ -300,7 +384,7 @@ def _input_item_to_chat_message(item) -> Optional[dict]:
         # Codex 可能发送 "developer" 角色，映射为 system
         if role == "developer":
             role = "system"
-        content = _flatten_content(item.get("content"))
+        content = _chat_content(item.get("content"))
         msg = {"role": role, "content": content}
         if item.get("name"):
             msg["name"] = item["name"]
@@ -328,13 +412,18 @@ def _input_item_to_chat_message(item) -> Optional[dict]:
             }],
         }
 
+    elif kind in {"input_image", "image_url"}:
+        # 顶层裸图片 item：作为 user 消息的结构化 image_url 透传
+        return {"role": "user", "content": _chat_content([item])}
+
     elif kind == "reasoning":
         # reasoning items 没有直接的 chat 对等物，跳过
         return None
 
     else:
-        # 未知类型：尝试作为 user message 处理
-        content = _flatten_content(item.get("content"))
+        # 未知类型（含省略 type 的 {role, content} 简写）：按 user message 处理，
+        # 保留结构化图片。
+        content = _chat_content(item.get("content"))
         if content:
             return {"role": "user", "content": content}
         return None
@@ -342,6 +431,7 @@ def _input_item_to_chat_message(item) -> Optional[dict]:
 
 def _flatten_content(content) -> str:
     """展平 content 字段：字符串直接返回，数组取 text，对象取字符串。"""
+    _reject_image_content(content)
     if content is None:
         return ""
     if isinstance(content, str):
@@ -356,9 +446,10 @@ def _flatten_content(content) -> str:
                 if pt in ("input_text", "output_text", "text"):
                     parts.append(str(p.get("text", "")))
                 elif pt == "image_url" or pt == "input_image":
-                    url = p.get("image_url", "")
-                    url_str = url.get("url", "") if isinstance(url, dict) else str(url)
-                    parts.append(f"[image: {url_str}]")
+                    # Defensive: user-message images should be handled by
+                    # _chat_content. Reaching the text flattener means an image
+                    # arrived where only text is allowed.
+                    raise UnsupportedImageInput("该位置的图片输入暂不支持透传；请求未发送至上游。")
                 elif pt == "file":
                     parts.append("[file]")
                 else:
@@ -393,10 +484,19 @@ def _response_error(error: Optional[dict]) -> Optional[dict]:
     if not error:
         return None
     code = str(error.get("code") or "server_error")
+    message = str(error.get("message") or "The upstream response failed.")
+    if code == "context_length_exceeded":
+        # ResponseError has a closed code enum. Preserve the canonical reason
+        # in its message; streaming also exposes the open-code ErrorEvent.
+        return {"code": "invalid_prompt", "message": _context_error_message(message)}
     return {
         "code": code if code in _RESPONSE_ERROR_CODES else "server_error",
-        "message": str(error.get("message") or "The upstream response failed."),
+        "message": message,
     }
+
+
+def _context_error_message(message: str) -> str:
+    return message if message.startswith("context_length_exceeded:") else f"context_length_exceeded: {message}"
 
 
 def _response_request_fields(resp_payload: Optional[dict]) -> dict:
@@ -475,7 +575,11 @@ def chat_response_to_responses(
     status = "completed"
     incomplete_details = None
     error = None
-    if "length" in finish_reasons:
+    if chat_resp.get("error"):
+        status = "failed"
+        raw_error = chat_resp["error"]
+        error = raw_error if isinstance(raw_error, dict) else {"message": str(raw_error)}
+    elif "length" in finish_reasons:
         status = "incomplete"
         incomplete_details = {"reason": "max_output_tokens"}
     elif "content_filter" in finish_reasons:
@@ -1052,6 +1156,13 @@ async def chat_stream_to_responses_stream(
             ),
         )
     else:
+        if stream_error and stream_error.get("code") == "context_length_exceeded":
+            yield event(
+                "error",
+                code="context_length_exceeded",
+                message=_context_error_message(stream_error["message"]),
+                param=None,
+            )
         yield event(
             "response.failed",
             response=response_snapshot(
@@ -1088,7 +1199,12 @@ async def proxy_responses(
       - ("error", (status_code, detail)) 错误
     """
     # 1. 转换为 Chat Completions 格式
-    chat_payload = responses_to_chat(resp_payload)
+    try:
+        chat_payload = responses_to_chat(resp_payload)
+    except UnsupportedImageInput as exc:
+        return ("error", (400, {"error": {
+            "type": "invalid_request_error", "code": "unsupported_image_input", "message": str(exc),
+        }}))
     _maybe_dump("responses_request_raw", resp_payload)
     _maybe_dump("responses_request_chat", chat_payload)
 

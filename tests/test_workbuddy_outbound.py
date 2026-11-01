@@ -149,7 +149,7 @@ def test_terminal_code_does_not_penalize_or_rotate(monkeypatch):
     monkeypatch.setattr(auth_manager, "get_valid_headers", headers)
     monkeypatch.setattr(auth_manager, "backend_url", lambda account=None: "https://copilot.tencent.com")
     monkeypatch.setattr(proxy, "_collect_stream", collect)
-    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *args: marks.append(args))
+    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *args, **kwargs: marks.append(args))
     monkeypatch.setattr(proxy, "_log_request", lambda *args, **kwargs: None)
 
     result = asyncio.run(proxy.proxy_chat_completions(
@@ -186,7 +186,7 @@ def test_auth_code_expires_and_tries_the_next_account(monkeypatch):
     monkeypatch.setattr(auth_manager, "get_valid_headers", headers)
     monkeypatch.setattr(auth_manager, "backend_url", lambda account=None: "https://copilot.tencent.com")
     monkeypatch.setattr(proxy, "_collect_stream", collect)
-    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *args: marks.append(args))
+    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *args, **kwargs: marks.append(args))
     monkeypatch.setattr(proxy, "_log_request", lambda *args, **kwargs: None)
     monkeypatch.setattr(proxy, "_retry_delay", lambda _attempt: _async_none())
 

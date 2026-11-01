@@ -365,3 +365,20 @@ def _sanitize_text(text: str) -> str:
             previous = text
             text = _KV_RE.sub("", text)
     return text.strip()
+
+def is_auth_failure(status: int, detail) -> bool:
+    """True only for *directly evidenced* authentication/authorization failure.
+
+    Deliberately narrower than ``account_rule``: ``account_rule`` also returns
+    ``expire`` for ``11140 + "request illegal"``, which is a rejected request,
+    not proof that the credentials are dead. Expiring an account on that would
+    be a different, unverified judgement, so it is excluded here.
+
+    Only these count:
+      * a recognised auth business code (``_AUTH_CODES``), or
+      * the explicit "offline user session" wording.
+    """
+    code, text = _primary_code(detail)
+    if code is not None and code in _AUTH_CODES:
+        return True
+    return "offline user session" in str(text or "").lower()

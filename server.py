@@ -525,6 +525,12 @@ async def resp_responses(
         resolve_reasoning_control(payload, prefer_nested=True)
     except InvalidReasoningControl as exc:
         raise _invalid_reasoning_http(exc) from exc
+    try:
+        responses.validate_responses_images(payload)
+    except responses.UnsupportedImageInput as exc:
+        return JSONResponse(status_code=400, content={"error": {
+            "type": "invalid_request_error", "code": "unsupported_image_input", "message": str(exc),
+        }})
     bound = router.bind_http(payload, api_key_info)
     _check_model_access(api_key_info, bound.original, bound.inner, bound.channel)
     try:
