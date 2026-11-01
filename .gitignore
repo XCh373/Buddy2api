@@ -92,3 +92,6 @@ ant-code-uploads/
 # Local launchd credentials
 /.admin_token
 /.client_key
+
+# 本地排查产物（回退基线与 review diff 不入库；回退靠 git 提交）
+docs/review/
