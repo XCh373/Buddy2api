@@ -93,19 +93,120 @@ def request_timeout(default: int) -> int:
         return default
 
 
+# ---------------------------------------------------------------------------
+# Account-expiry policy (deliberately minimal).
+#
+# Scope: a single edge-layer 401/403 (e.g. openresty/APISIX HTML body) must not
+# permanently expire an account, while a genuine, repeated authentication
+# failure still should. That is all this code claims to do.
+#
+# KNOWN LIMITATIONS (not solved here, by decision):
+#   * A credential renewal (browser login, token refresh, import/scan,
+#     control-plane import) and an administrator status change do not participate
+#     in the lock below. An older in-flight failure or refresh result can still
+#     race with them and, in principle, overwrite a newer status. Reproduced but
+#     left as a known limitation rather than fixed with an architecture change.
+#   * The tally is in-process; a restart clears it (may delay recognising a
+#     genuinely dead account).
+# Fixing all of the above would require a unified status/credential write path
+# across every provider and admin route, which is out of scope for this defect.
+# ---------------------------------------------------------------------------
+
+EXPIRE_CONFIRMATIONS = 2
+AUTH_CONFIRMATION_TTL_SEC = 6 * 3600
+
+_auth_confirm_lock = threading.Lock()
+_auth_confirmations: dict[int, tuple[int, float]] = {}
+
+# Serializes concurrent failures for the same account so two parallel failures
+# cannot both decide to expire from a stale read. Renewals/admin writes do not
+# take this lock (see known limitations).
+_account_state_locks: dict[int, threading.RLock] = {}
+_account_state_locks_guard = threading.Lock()
+
+
+def _account_state_lock(aid: int) -> threading.RLock:
+    with _account_state_locks_guard:
+        lock = _account_state_locks.get(int(aid))
+        if lock is None:
+            lock = threading.RLock()
+            _account_state_locks[int(aid)] = lock
+        return lock
+
+
+def reset_auth_confirmations() -> None:
+    with _auth_confirm_lock:
+        _auth_confirmations.clear()
+
+
+def reset_account_state_locks() -> None:
+    with _account_state_locks_guard:
+        _account_state_locks.clear()
+
+
+def auth_confirmation_count(aid: int) -> int:
+    with _auth_confirm_lock:
+        count, deadline = _auth_confirmations.get(int(aid), (0, 0.0))
+        if deadline and deadline < time.monotonic():
+            _auth_confirmations.pop(int(aid), None)
+            return 0
+        return count
+
+
+def clear_auth_confirmations(aid: int) -> None:
+    with _auth_confirm_lock:
+        _auth_confirmations.pop(int(aid), None)
+
+
+def _note_structural_auth(aid: int) -> int:
+    """Count one *structural* auth failure; return the running count.
+
+    Kept in its own store with its own TTL so that cooldown bookkeeping expiring
+    can never erase it (an earlier version shared one record and lost the tally).
+    """
+    deadline = time.monotonic() + AUTH_CONFIRMATION_TTL_SEC
+    with _auth_confirm_lock:
+        count, previous_deadline = _auth_confirmations.get(int(aid), (0, 0.0))
+        if previous_deadline and previous_deadline < time.monotonic():
+            count = 0
+        count += 1
+        _auth_confirmations[int(aid)] = (count, deadline)
+        return count
+
+
 def mark_account_success(aid: int):
     with _failure_lock:
         _account_failures.pop(aid, None)
+    clear_auth_confirmations(aid)
 
 
-def mark_account_failure(aid: int, status_code: int = 0):
-    with _failure_lock:
-        count, _ = _account_failures.get(aid, (0, 0.0))
-        count += 1
-        base = 30 if status_code in {401, 403, 429} else 5
-        cooldown = min(300, base * (2 ** min(count - 1, 4)))
-        _account_failures[aid] = (count, time.monotonic() + cooldown)
-    if status_code in {401, 403}:
+def mark_account_failure(aid: int, status_code: int = 0, *, structural_auth: bool = False):
+    """Record one failed attempt.
+
+    Cooldown bookkeeping is recorded for every failure. ``status='expired'`` is
+    written only when ``structural_auth`` is True (a well-formed authentication
+    failure, never a bare edge 401 or a rate-limit code) AND the consecutive
+    structural-auth tally reaches ``EXPIRE_CONFIRMATIONS`` AND the account is
+    currently ``active`` (an operator-set ``inactive`` is never overwritten).
+    """
+    with _account_state_lock(aid):
+        with _failure_lock:
+            count, _ = _account_failures.get(aid, (0, 0.0))
+            count += 1
+            base = 30 if status_code in {401, 403, 429} else 5
+            cooldown = min(300, base * (2 ** min(count - 1, 4)))
+            _account_failures[aid] = (count, time.monotonic() + cooldown)
+
+        if status_code not in {401, 403}:
+            return
+        if not structural_auth:
+            # Edge-layer rejection: cool down, but never push toward expiry.
+            return
+        if _note_structural_auth(aid) < EXPIRE_CONFIRMATIONS:
+            return
+        current = db.get_account(aid)
+        if current is None or current.get("status") != "active":
+            return
         db.update_account(aid, {"status": "expired"})
 
 
@@ -694,6 +795,7 @@ async def refresh_token_result(account: dict) -> dict:
             update_data["session_state"] = session_state
         db.update_account(aid, update_data)
         clear_session_dead(aid)
+        clear_auth_confirmations(aid)
         return _refresh_view(current, ok=True, reason="refreshed", message="已续期", status_code=status_code)
 
 
@@ -736,6 +838,7 @@ def upsert_login_account(parsed: dict) -> dict:
             patch["session_state"] = parsed["session_state"]
         db.update_account(existing["id"], patch)
         clear_session_dead(existing["id"])
+        clear_auth_confirmations(existing["id"])
         return {"id": existing["id"], "updated": True}
     aid = db.add_account({**parsed, "provider": "workbuddy", "status": "active"})
     return {"id": aid, "updated": False}

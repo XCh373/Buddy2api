@@ -278,86 +278,13 @@ def codex_prompt_limit(channel: str, model: str) -> tuple[int, int]:
     return max(1, window - 32768), window
 
 
-def _is_system_item(item) -> bool:
-    return isinstance(item, dict) and item.get("role") in ("system", "developer")
-
-
-def _is_tool_carrier(item) -> bool:
-    if not isinstance(item, dict):
-        return False
-    if item.get("type") in ("function_call", "function_call_output"):
-        return True
-    if item.get("role") == "tool":
-        return True
-    return item.get("role") == "assistant" and bool(item.get("tool_calls"))
-
-
-def _history_segments(items: list) -> list[list]:
-    """Keep a tool call and its results in one segment so trimming cannot split them."""
-    segments = []
-    index = 0
-    while index < len(items):
-        item = items[index]
-        if _is_tool_carrier(item) or (isinstance(item, dict) and item.get("type") == "reasoning"):
-            group = []
-            while index < len(items) and (
-                _is_tool_carrier(items[index])
-                or (isinstance(items[index], dict) and items[index].get("type") == "reasoning")
-            ):
-                group.append(items[index])
-                index += 1
-            segments.append(group)
-            continue
-        segments.append([item])
-        index += 1
-    return segments
-
-
-def _trim_history(payload: dict, key: str, limit: int) -> list:
-    """Drop oldest history until the whole payload fits, keeping the newest segment."""
-    segments = _history_segments(payload[key])
-    while estimate_prompt_tokens(payload) > limit and len(segments) > 1:
-        drop_at = next(
-            (
-                index
-                for index, segment in enumerate(segments[:-1])
-                if not all(_is_system_item(item) for item in segment)
-            ),
-            None,
-        )
-        if drop_at is None:
-            drop_at = 0
-        segments.pop(drop_at)
-        payload[key] = [item for segment in segments for item in segment]
-    return payload[key]
-
-
 def trim_codex_prompt(payload: dict, channel: str, model: str) -> dict:
-    """Trim old Codex history so the current turn can continue."""
-    limit, window = codex_prompt_limit(channel, model)
-    if estimate_prompt_tokens(payload) <= limit:
-        return payload
-    trimmed = copy.deepcopy(payload)
-    if isinstance(trimmed.get("input"), list):
-        _trim_history(trimmed, "input", limit)
-    elif isinstance(trimmed.get("messages"), list):
-        _trim_history(trimmed, "messages", limit)
-    if estimate_prompt_tokens(trimmed) <= limit:
-        return trimmed
-    raise HTTPException(
-        status_code=400,
-        detail={
-            "error": {
-                "message": (
-                    f"Codex prompt is too long for {model}: the newest request still exceeds "
-                    f"the {limit}-token Codex budget ({window}-token window) after trimming old history."
-                ),
-                "type": "invalid_request_error",
-                "code": "prompt_too_long",
-                "param": "input",
-            }
-        },
-    )
+    """Compatibility entry point: history compaction is owned by the client.
+
+    The old rough budget is not a confirmed upstream limit and must neither
+    delete history nor become a new hard rejection threshold.
+    """
+    return payload
 
 
 def dispatch_payload(payload: dict, inner: str) -> dict:

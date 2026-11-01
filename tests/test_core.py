@@ -884,11 +884,11 @@ def test_http_endpoints_reject_invalid_reasoning_controls(
     assert error.value.detail["error"]["code"] == "invalid_reasoning_control"
 
 
-def test_responses_input_image_string_is_preserved():
-    flattened = responses._flatten_content(
-        [{"type": "input_image", "image_url": "data:image/png;base64,abc"}]
-    )
-    assert "data:image/png;base64,abc" in flattened
+def test_responses_input_image_is_rejected_without_flattening_base64():
+    with pytest.raises(responses.UnsupportedImageInput):
+        responses._flatten_content(
+            [{"type": "input_image", "image_url": "data:image/png;base64,abc"}]
+        )
 
 
 @pytest.mark.parametrize(
@@ -1207,7 +1207,7 @@ def test_responses_json_schema_constraint_survives_codex_instruction_replacement
     assert "response_format" in chat_payload
 
 
-def test_codex_prompt_gate_trims_old_history_and_keeps_latest(monkeypatch):
+def test_codex_prompt_gate_preserves_old_history_above_legacy_budget(monkeypatch):
     monkeypatch.setattr(router, "codex_prompt_limit", lambda channel, model: (30, 128))
     payload = {
         "model": "deepseek-v4-flash",
@@ -1222,12 +1222,13 @@ def test_codex_prompt_gate_trims_old_history_and_keeps_latest(monkeypatch):
 
     assert trimmed["input"][0]["content"] == "keep"
     assert trimmed["input"][-1]["content"] == "latest"
-    assert len(trimmed["input"]) < len(payload["input"])
-    assert router.estimate_prompt_tokens(trimmed) <= 30
+    assert trimmed is payload
+    assert len(trimmed["input"]) == 3
+    assert router.estimate_prompt_tokens(trimmed) > 30
     assert proxy.resolve_model_alias("gpt-5.6-luna") == "deepseek-v4-flash"
 
 
-def test_codex_trim_counts_cjk_and_keeps_tool_pairs(monkeypatch):
+def test_codex_gate_counts_cjk_but_preserves_tool_pairs(monkeypatch):
     assert router.estimate_prompt_tokens({"input": "你" * 4000}) >= 4000
 
     payload = {
@@ -1247,10 +1248,11 @@ def test_codex_trim_counts_cjk_and_keeps_tool_pairs(monkeypatch):
 
     trimmed = router.trim_codex_prompt(payload, "workbuddy", "deepseek-v4-flash")
 
-    assert [item.get("type") for item in trimmed["input"]] == ["message"]
+    assert trimmed is payload
+    assert [item.get("type") for item in trimmed["input"]] == ["function_call", "function_call_output", "message"]
     assert trimmed["input"][-1]["content"] == "latest"
     assert trimmed["instructions"] == "I" * 160
-    assert router.estimate_prompt_tokens(trimmed) <= router.estimate_prompt_tokens(payload) - 1
+    assert router.estimate_prompt_tokens(trimmed) == router.estimate_prompt_tokens(payload)
 
 
 def test_responses_stream_reassembles_byte_split_tool_arguments():

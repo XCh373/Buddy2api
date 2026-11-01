@@ -1505,10 +1505,10 @@ createApp({
       <div class="card-p empty" v-else><p>{{automationFilter==='failed'?'最近没有失败记录':'暂无自动化日志'}}</p></div>
     </div>
     <div class="card">
-      <div class="card-h">上下文预算<span class="sub">只影响 Loomy 发送前裁剪</span></div>
+      <div class="card-h">上下文预算<span class="sub">旧版兼容设置，不再裁剪历史</span></div>
       <div class="card-p">
         <div class="form-grid">
-          <div class="field"><label>Loomy 上下文预算</label><input v-model.number="s.loomy_context_budget" type="number" min="0" max="2000000" placeholder="160000"/><div class="hint">只在发送前裁 Loomy 的旧对话，默认 160000 token。填 0 关闭发送前裁剪。上游拒绝上下文时仍会再裁一次。CB_LOOMY_CONTEXT_BUDGET 可覆盖。</div></div>
+          <div class="field"><label>Loomy 上下文预算</label><input v-model.number="s.loomy_context_budget" type="number" min="0" max="2000000" placeholder="160000"/><div class="hint">旧版预算默认 160000 token，现仅保留配置兼容。网关不再按此值裁剪或拒绝请求；上游超限交由客户端压缩处理。</div></div>
         </div>
       </div>
     </div>

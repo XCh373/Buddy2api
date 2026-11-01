@@ -225,7 +225,7 @@ def test_expired_token_fallback_and_stop(wire, monkeypatch, stream):
     assert ("11128" in result.text)
 
 
-def test_budget_retry_and_responses_trim_keep_identity(wire, monkeypatch):
+def test_context_error_does_not_retry_and_preserves_identity(wire, monkeypatch):
     cfg, caller, aids, captures, failures = wire
     seen = []
     provider = providers.get_provider("workbuddy")
@@ -236,10 +236,10 @@ def test_budget_retry_and_responses_trim_keep_identity(wire, monkeypatch):
             return ("error", (400, {"code": 11115}))
         return await real(body, info)
     monkeypatch.setattr(provider, "chat_completions", chat)
-    monkeypatch.setattr(context_budget, "recovery_payload", lambda body: (dict(body), True))
     result = asyncio.run(post("responses"))
-    assert result.status_code == 200 and seen[0] == seen[1]
-    # Codex trimming executes after identity parsing, before conversion.
+    assert result.status_code == 400 and len(seen) == 1
+    assert result.json()["error"]["code"] == "context_length_exceeded"
+    # Codex compatibility gate executes after identity parsing, before conversion.
     db.update_api_key(caller, {"client_type": "codex"})
     monkeypatch.setattr(router, "trim_codex_prompt", lambda body, *args: {"model": "auto", "input": "trimmed"})
     assert asyncio.run(post("responses")).status_code == 200

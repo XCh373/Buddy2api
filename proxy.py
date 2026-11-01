@@ -74,13 +74,21 @@ def _is_retryable_status(status: int) -> bool:
 
 
 def _apply_account_rule(account_id: int, status: int, detail):
-    """Apply a Tencent envelope decision. None means the HTTP status path stays."""
+    """Apply a Tencent envelope decision. None means the HTTP status path stays.
+
+    ``account_rule`` may return ``expire`` for shapes that are not proven
+    credential death (notably ``11140 + "request illegal"``). Only the narrower
+    :func:`workbuddy_outbound.is_auth_failure` verdict may count toward actually
+    marking the account expired; a non-auth "expire" still rotates to the next
+    account via its cooldown, but cannot write ``status='expired'``.
+    """
     ruled = workbuddy_outbound.account_rule(status, detail)
     if ruled is None:
         return None
     action, client_status, client_detail, failure = ruled
     if action == "expire":
-        auth_manager.mark_account_failure(account_id, 401)
+        structural = workbuddy_outbound.is_auth_failure(status, detail)
+        auth_manager.mark_account_failure(account_id, 401, structural_auth=structural)
     elif action == "rotate":
         auth_manager.mark_account_failure(account_id, 429)
     return action, client_status, client_detail, failure
@@ -815,6 +823,9 @@ async def _json_chat_with_retries(
         tried_ids.add(account["id"])
         headers = await auth_manager.get_valid_headers(account)
         if not headers:
+            # Refresh failed. The refresh routine owns credential-death
+            # accounting (SESSION_DEAD_THRESHOLD); here we only cool down so a
+            # transient/rate-limited/rejected refresh cannot expire the account.
             auth_manager.mark_account_failure(account["id"], 401)
             continue
 
@@ -847,7 +858,9 @@ async def _json_chat_with_retries(
                 return last_error
             await _retry_delay(attempt)
             continue
-        auth_manager.mark_account_failure(account["id"], err_status)
+        auth_manager.mark_account_failure(
+            account["id"], err_status,
+            structural_auth=workbuddy_outbound.is_auth_failure(err_status, detail))
         will_retry = _is_retryable_status(err_status) and attempt < max_retries - 1
         error_message = detail
         if isinstance(detail, dict):
@@ -1015,6 +1028,7 @@ async def _stream_upstream(
         tried_ids.add(account["id"])
         headers = await auth_manager.get_valid_headers(account)
         if not headers:
+            # Refresh failed; cooldown only (see note in the JSON path).
             auth_manager.mark_account_failure(account["id"], 401)
             last_error = b"Account credentials are invalid"
             last_error_event = None
@@ -1085,7 +1099,9 @@ async def _stream_upstream(
                         last_error_event = None
                         last_status = response.status_code
                         last_failure = failure
-                        auth_manager.mark_account_failure(account["id"], response.status_code)
+                        auth_manager.mark_account_failure(
+                            account["id"], response.status_code,
+                            structural_auth=workbuddy_outbound.is_auth_failure(response.status_code, parsed))
                         if _is_retryable_status(response.status_code) and attempt < max_attempts - 1:
                             pending_retry_log = {
                                 "account": account,
