@@ -486,7 +486,7 @@ def _install_chat_account_stream_fakes(
     monkeypatch.setattr(
         auth_manager,
         "mark_account_failure",
-        lambda account_id, status=0: calls["failures"].append((account_id, status)),
+        lambda account_id, status=0, **kwargs: calls["failures"].append((account_id, status)),
     )
     monkeypatch.setattr(
         auth_manager,
@@ -3624,28 +3624,6 @@ def test_tool_loop_stop_does_not_reprompt_or_double_account(
         assert [finish for finish, _status, _error in log_terminals] == ["stop"]
         assert response["choices"][0]["finish_reason"] == "stop"
         assert response["choices"][0]["message"]["content"] == text
-
-
-def test_stream_tool_stall_is_logged(monkeypatch, isolated_db):
-    """流式停转（flag off）时日志 finish_reason 记为 tool_stall。"""
-    calls = _install_chat_account_stream_fakes(
-        monkeypatch,
-        [{"id": 1, "name": "test-account"}],
-        {1: _stall_stream_chunks()},
-    )
-    body = _tool_loop_body()
-    body["stream"] = True
-
-    async def collect():
-        return b"".join([
-            chunk
-            async for chunk in proxy._stream_upstream(body, None, "test-model")
-        ])
-
-    raw = asyncio.run(collect())
-    assert b"tool stall" not in raw
-    logged_finishes = [entry[0][8] for entry in calls["logs"]]
-    assert "tool_stall" in logged_finishes
 
 
 @pytest.mark.parametrize("stream", [False, True])

@@ -579,7 +579,9 @@ def test_completed_response_releases_pin_without_generator_gc(wire, monkeypatch,
             result = await post(path, stream=True)
             assert result.status_code == 200
             assert not affinity.get_store(wire[0]).active
-            assert len(wire[3]) == (3 if upstream_error else 1)
+            # v2.2.13: the retry budget spans the whole pool, so an all-500
+            # upstream is retried once per account instead of the old cap of 3.
+            assert len(wire[3]) == (len(wire[2]) if upstream_error else 1)
         finally:
             for stream in held:
                 await stream.aclose()
