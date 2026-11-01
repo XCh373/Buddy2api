@@ -4,11 +4,11 @@
 
 > Local consumer AI clients → one OpenAI-compatible API for Codex, OpenCode, Cherry Studio, NextChat, and similar agents. Work Buddy / CodeBuddy, Qoder, QwenWork, TraeWork, iFlytek Loomy, and SenseTime Xiaohuanxiong are on by default; pick one in the UI dropdown. Each request stays on one channel. QClaw is retired; its credits moved to WorkBuddy.
 
-Release **2.2.9**. Default channels include WorkBuddy domestic and international, Qoder CN and international, QwenWork, TraeWork, Loomy, and Xiaohuanxiong. Channels without a stored login are omitted from the model list. Local use only, and only with accounts you personally own. Do not expose this on the public internet, and do not share credentials, API keys, or the database.
+Release **2.2.13**. Default channels include WorkBuddy domestic and international, Qoder CN and international, QwenWork, TraeWork, Loomy, and Xiaohuanxiong. Channels without a stored login are omitted from the model list. Local use only, and only with accounts you personally own. Do not expose this on the public internet, and do not share credentials, API keys, or the database.
 
 **Your own accounts only. Do not use SMS-code platforms, bulk registration, or any batch method to farm credits.** Do not expose the gateway to other people, claim rewards for them, or resell quota.
 
-Default loopback startup opens the management page without an Admin Token. Restarting does not invalidate local access. Repeated startup opens the existing instance; a database can only be used by one process. Use `--no-browser` for background services. `start.sh` and `start-launchd.sh` do not automatically read `.admin_token`; setting `--admin-token` or `CB_GATEWAY_ADMIN_TOKEN` explicitly enables token authentication and is required for non-loopback listeners. Enter that token in management settings when token mode is enabled. Client API keys and upstream account credentials are unchanged.
+Default loopback startup opens the management page without an Admin Token. Restarting does not invalidate local access. Repeated startup opens the existing instance; a database can only be used by one process. Use `--no-browser` for background services. Setting `--admin-token` or `CB_GATEWAY_ADMIN_TOKEN` enables explicit token authentication and is required for non-loopback listeners. Enter that token in the management settings. Client API keys and upstream account credentials are unchanged.
 
 ## What is this?
 
@@ -18,7 +18,7 @@ Five channels are on by default. A channel with no local login shows empty on Ac
 
 Qoder CN reads `%APPDATA%\com.qodercn.app.stable\auth.v1.dat`. Qoder international reads `%APPDATA%\com.qoder.app.stable\auth.v1.dat`. Their login files, model catalogs, and tokens are not interchangeable. Quota is shown from claim results and the official balance. Tool calls are returned to the local client.
 
-Loomy reads a local `auth-session.json`. Its daily balance is granted upstream; one-click claim only reads that balance. Long Loomy chats are trimmed to a 160k-token budget before send. Xiaohuanxiong reads a local `auth.json`, and one-click claim triggers the daily grant. Neither channel uses the WorkBuddy CLI header set.
+Loomy reads a local `auth-session.json`. Its daily balance is granted upstream; one-click claim only reads that balance. Long Loomy chats are trimmed to a 160k-token budget before send. Xiaohuanxiong reads a local `auth.json`, and one-click claim triggers the daily grant. The current client stores it at `%USERPROFILE%\.office-raccoon\agent\config\auth.json`; the old `%USERPROFILE%\.box-agent\config\auth.json` is still scanned. When the file has no user id, accounts are separated by the subject in the login token, so importing a second login does not replace the first. If the official client revokes the previous login on sign-out, that saved account still dies and must be imported while it is signed in. Neither channel uses the WorkBuddy CLI header set.
 
 ```powershell
 python server.py
@@ -33,7 +33,7 @@ python server.py
 | QwenWork | on | `%APPDATA%\QwenWorkCN` |
 | TraeWork | on | `%APPDATA%\TRAE SOLO CN\User\globalStorage`; newer Trae CN also uses `%APPDATA%\Trae CN\User\globalStorage` |
 | iFlytek Loomy | on | `%PUBLIC%\Loomy\*\userData\auth-session.json` |
-| SenseTime Xiaohuanxiong | on | `%USERPROFILE%\.box-agent\config\auth.json` |
+| SenseTime Xiaohuanxiong | on | `%USERPROFILE%\.office-raccoon\agent\config\auth.json`; old clients still use `%USERPROFILE%\.box-agent\config\auth.json` |
 
 Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 
@@ -44,8 +44,6 @@ Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 3. **HTTP 503 `channel_unavailable`** means that channel has no imported account.
 4. **Run QwenWork with `python server.py` on Windows.** A Linux Docker container cannot decrypt its DPAPI files; the UI says so. WorkBuddy can stay on Docker.
 5. If the chat client is itself in Docker, Base URL is `http://host.docker.internal:8787/v1`.
-
-WorkBuddy 5.6+ encrypts sensitive fields in `.info` login snapshots. Detection and manual import try to decrypt them with the locally installed WorkBuddy app; a snapshot is marked invalid or skipped if the local key cannot be read. The detection list groups snapshots by channel and UID, showing the newest by default while keeping older snapshots expandable.
 
 ## Install
 
@@ -66,13 +64,13 @@ python server.py
 
 3. Open http://127.0.0.1:8787 → Accounts → Detect → Import → Test → API Keys (automatic channel by default; pick one channel to pin the key) → point your client at `http://127.0.0.1:8787/v1`.
 
-Windows script: `.\start.bat`. Docker helper: `.\start-docker-win.ps1` (WorkBuddy mount; use native Python for QwenWork). That helper builds from the local checkout. The upstream-only prebuilt image (without fork features) is `ghcr.io/wicm84266964/buddy2api:v2.2.9` (`linux/amd64` only).
+Windows script: `.\start.bat`. Docker helper: `.\start-docker-win.ps1` (WorkBuddy mount; use native Python for QwenWork). That helper builds from the local checkout. The prebuilt image is `ghcr.io/wicm84266964/buddy2api:v2.2.13` (`linux/amd64` only).
 
 Later starts: `conda activate buddy2api` then `python server.py` in the project directory.
 
 ## Docker
 
-This fork builds from source by default to retain session affinity and other custom features. The upstream image below does not include those features. The official upstream image is published only to GHCR, not Docker Hub: `ghcr.io/wicm84266964/buddy2api:v2.2.9`. A stable release also moves `latest`; prereleases do not. Pin the version tag. The image is `linux/amd64` only.
+The official image is published only to GHCR, not Docker Hub: `ghcr.io/wicm84266964/buddy2api:v2.2.13`. A stable release also moves `latest`; prereleases do not. Pin the version tag. The image is `linux/amd64` only.
 
 The first push can create a private GitHub Packages container. The repository owner must change that package to public once before anonymous `docker pull` works.
 
@@ -82,28 +80,29 @@ From a checkout:
 
 ```powershell
 $env:CB_GATEWAY_ADMIN_TOKEN="cb-admin-replace-with-a-long-random-value"
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-`docker-compose.yml` uses only `build: .` and never pulls the upstream image by default. Use `docker compose up -d --build` or `.\start-docker-win.ps1` to build from source.
+`docker-compose.yml` pins the current tag and still has `build: .`. Use `docker compose up -d --build` or `.\start-docker-win.ps1` to build from source.
 
-For upstream features only, without cloning:
+Without cloning:
 
 ```powershell
-docker pull ghcr.io/wicm84266964/buddy2api:v2.2.9
+docker pull ghcr.io/wicm84266964/buddy2api:v2.2.13
 docker run -d --name buddy2api --restart unless-stopped `
   -p 127.0.0.1:8787:8787 `
   -v buddy2api-data:/app/data `
   -e CB_GATEWAY_ADMIN_TOKEN="cb-admin-replace-with-a-long-random-value" `
   -e CB_DOCKER=1 `
-  ghcr.io/wicm84266964/buddy2api:v2.2.9
+  ghcr.io/wicm84266964/buddy2api:v2.2.13
 ```
 
 ## FAQ
 
 - `conda` not found: use Miniconda Prompt, or `conda init powershell` and reopen the terminal.
 - `No module named ...`: activate `buddy2api`, then `python -m pip install -r requirements.txt`.
-- Port 8787 in use: stop the old process or `python server.py --port 8788`.
+- Port 8787 in use: stop the old process or `python server.py --port 8788`. After a one-click update, use the top-bar Close button if there is no console window.
 - No accounts in the UI: import has not been run yet.
 - Key create fails: the channel dropdown is required.
 - 403 `key_channel_mismatch`: the model prefix does not match the key’s channel.
@@ -111,8 +110,7 @@ docker run -d --name buddy2api --restart unless-stopped `
 
 ## Update
 
-The background version check uses jsDelivr first and caches the result briefly. A manual **Check for updates** action and the pre-apply recheck query the configured repository's GitHub `main` through the Contents API, then GitHub raw as a fallback. If both authoritative sources fail, the gateway reports that the remote version is unavailable instead of treating a CDN value as confirmation that the install is current. This fork defaults to `XCh373/Buddy2api`'s `main`; override the source with `CB_GATEWAY_UPDATE_REPO=owner/repo`. A top-bar **Update to vx.y.z** button runs `git pull --ff-only` from the current branch's configured tracking remote, reinstalls requirements, and restarts. For this fork, `main` should track `origin/main`, and `origin` should point to your fork so the check and pull targets stay aligned. Pull and dependency installation reuse `HTTPS_PROXY`, `ALL_PROXY`, or an explicit OS proxy address, without changing Git config or hardcoding a port. A PAC script without an explicit address leaves Git connecting directly. Docker images, zip copies, and non-`main` checkouts keep using a manual pull. To preview the button on an already-current install, start with `CB_GATEWAY_FAKE_LATEST=9.9.9`; the click does not pull or restart.
-
+The management page checks for a newer `main` in the background (jsDelivr first). A top-bar **Update to vx.y.z** button runs `git pull --ff-only`, reinstalls requirements, and restarts. That pull and install reuse `HTTPS_PROXY`, `ALL_PROXY`, or an explicit OS proxy address. The button does not hardcode a port or change Git config. A PAC script with no explicit address still leaves Git connecting directly. A failed check stays silent. Docker images, zip copies, and non-`main` checkouts keep using a manual update. For Docker, pull the tag pinned in compose and restart: `docker compose pull` then `docker compose up -d`. To preview the button on an already-current install, start with `CB_GATEWAY_FAKE_LATEST=9.9.9`; the click does not pull or restart.
 
 ## Upgrade from 1.4.x
 
@@ -128,6 +126,12 @@ The database migrates on startup. Existing keys stay on `workbuddy`. Startup no 
 
 Unprefixed `auto` follows the key’s channel. Use a separate key per channel. On the Models page, “一键读取供应模型” refreshes each channel’s supplier list separately; a TraeWork-only id such as Doubao is never merged into WorkBuddy.
 
+### Account priority, saving, and request logs
+
+For automatic-channel keys, a bare alias or `auto` chooses the matching channel whose active account has the highest priority. Larger numbers win; ties keep the default channel order. Channel-bound keys and `channel/model` requests keep their explicit channel. Retry budgets cover the channel's whole account pool instead of stopping after three accounts. Each channel retains its existing rules for non-retryable errors and streams that have already started output.
+
+Accounts → **保存全部修改** saves every edited row, including rows hidden by filters. Failed rows keep their edits for retry, and saving one row preserves other drafts. Request logs show the requested alias, selected channel, and resolved model, and support searching by resolved model. Historical logs keep their original fields without backfilling mappings.
+
 ### Model capacity discovery
 
 Refreshing supplier models now retains upstream input/output capacities. `/v1/models` exposes `context_window` and `max_output_tokens`; WorkBuddy's `maxInputTokens` and `maxOutputTokens` map to these fields, rather than treating its desktop `contextWindow.defaultLength` as the maximum. DSH custom providers can import these capacities through **Fetch available models**, then add and save the selected models. Existing configured models are not overwritten automatically.
@@ -136,7 +140,7 @@ Missing fields independently fall back to 262,144 context tokens and 32,768 outp
 
 ### Reasoning effort
 
-WorkBuddy's collected responses reject partial text without completion metadata instead of synthesizing a successful `stop`. An explicit `finish_reason` followed by EOF remains valid without `[DONE]`; a `[DONE]` event alone does not make text without a finish reason complete. A valid `stop` is returned as the model's completed answer even when tool results appear in the history. The gateway does not infer another tool call from the answer text, and the legacy `CB_GATEWAY_TOOL_STALL_RETRY` and `CB_GATEWAY_TOOL_STALL_FAIL_STREAM` variables no longer affect requests.
+WorkBuddy's collected responses, including the default tool-stall retry path, reject partial text without completion metadata instead of synthesizing a successful `stop`. An explicit `finish_reason` followed by EOF remains valid without `[DONE]`. A `[DONE]` event alone does not make text without a finish reason complete. This validation does not determine whether a model's explicit `stop` is premature or resolve every long-session stall.
 
 Agent clients can send top-level `reasoning_effort` to Chat Completions and the standard `reasoning: {"effort": "high"}` object to Responses. Compatibility forms used by OpenCode, DSH, Cherry, and Claude-style clients are also accepted: `reasoning.effort`, `reasoningEffort`, `thinking.type`, `thinking.effort`, `output_config.effort`, and `enable_thinking`. Accepted levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; `off` is an alias for `none`.
 
@@ -154,14 +158,6 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer sk-cb-your-key" \
   -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
 ```
-
-## Expiring credit routing
-
-In Settings, use the WorkBuddy account routing controls to enable expiry-first routing. It is off by default. Manual account priority takes precedence; within that priority, accounts with earlier expiring usable credits are preferred. Accounts with the same expiry retain stickiness. Other channels keep their existing routing.
-
-Defaults: a 30-day expiry window, resource refresh every 120 seconds, and a maximum cache age of 300 seconds. Failed or stale snapshots and conservatively exhausted credits lose their expiry advantage; routing falls back to the existing policy. The saved-policy preview explains the expected account without changing stickiness or querying resources.
-
-The upstream owns deduction within an account. Local consumption estimates do not capture all external or in-flight usage. Background resource queries may refresh credentials; separate local databases do not isolate the same upstream account across instances. Disabling the policy stops new policy-specific background queries.
 
 ## Environment
 

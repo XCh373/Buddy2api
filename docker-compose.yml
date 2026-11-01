@@ -1,6 +1,7 @@
 services:
   buddy2api:
-    # Build this fork: upstream images do not include fork-specific features.
+    # 预构建镜像。发版时和 version.py、README 里的标签一起改。
+    image: ghcr.io/wicm84266964/buddy2api:v2.2.13
     build: .
     container_name: buddy2api
     ports:

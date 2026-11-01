@@ -170,3 +170,57 @@ def test_create_key_form_defaults_to_auto_channel():
     assert "f.channel='*'" in html
     assert "channel:'workbuddy'}),res" not in html
     assert "f.channel='workbuddy'" not in html
+    assert "modal key-create" in html
+    assert "channel-hint" in html
+    assert "keys-channel" in html
+    assert 'style="max-width:560px"' not in html
+
+
+@pytest.mark.parametrize("model", ["gpt-4o", "auto"])
+def test_any_channel_uses_highest_account_priority(isolated_db, all_channels, model):
+    aliases.save_user_aliases({"traework": {"gpt-4o": "qwen-3.7-plus"}})
+    wb = db.add_account({"name": "wb", "uid": "wb", "provider": "workbuddy", "priority": 1})
+    tw = db.add_account({"name": "tw", "uid": "tw", "provider": "traework", "priority": 10})
+    db.add_account({"name": "disabled", "uid": "disabled", "provider": "workbuddy", "priority": 100, "status": "inactive"})
+    assert router.bind({"model": model}, {"default_channel": "*"}).channel == "traework"
+    # Explicit prefixes and channel-bound keys keep their binding.
+    assert router.bind({"model": "workbuddy/" + model}, {"default_channel": "*"}).channel == "workbuddy"
+    assert router.bind({"model": model}, {"default_channel": "workbuddy"}).channel == "workbuddy"
+    db.update_account(tw, {"priority": 1})
+    assert router.bind({"model": model}, {"default_channel": "*"}).channel == "workbuddy"
+    db.update_account(wb, {"priority": -2})
+    db.update_account(tw, {"priority": -1})
+    assert router.bind({"model": model}, {"default_channel": "*"}).channel == "traework"
+
+
+@pytest.mark.parametrize("responses_api", [False, True])
+def test_dispatch_logs_alias_and_resolved_model(isolated_db, all_channels, monkeypatch, responses_api):
+    from providers.traework import chat
+    import time
+
+    aliases.save_user_aliases({"traework": {"test-alias": "qwen-3.7-plus"}})
+    account_id = db.add_account({"name": "tw", "uid": "tw", "provider": "traework"})
+    key_id = db.add_api_key("sk-test-issue127", "test", default_channel="traework")
+    key = {"id": key_id, "name": "test", "default_channel": "traework"}
+
+    async def send(payload, info):
+        assert payload["model"] == "qwen-3.7-plus"
+        chat._log(info, db.get_account(account_id), payload["model"], False, "stop", 200, "", time.time())
+        return ("json", {"id": "test", "object": "chat.completion", "model": payload["model"],
+                         "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(providers.get_provider("traework"), "chat_completions", send)
+    bound = router.bind({"model": "traework/test-alias"}, key)
+    handler = router.responses_after_bind if responses_api else router.chat_after_bind
+    payload = {"model": bound.original, "input": "ping"} if responses_api else {"model": bound.original, "messages": [{"role": "user", "content": "ping"}]}
+    result = asyncio.run(handler(bound, payload, key))
+    assert result[1]["model"] == "traework/test-alias"
+    row = db.search_logs({"q": "qwen-3.7-plus"})["items"][0]
+    assert row["model"] == "traework/test-alias"
+    assert row["resolved_model"] == "qwen-3.7-plus"
+    assert row["provider"] == "traework"
+    recent = db.get_stats()["recent_logs"][0]
+    assert recent["resolved_model"] == "qwen-3.7-plus"
+    assert recent["provider"] == "traework"
+    db.init_db()  # The schema migration is idempotent and keeps the new field.
+    assert db.search_logs({"q": "test-alias"})["items"][0]["resolved_model"] == "qwen-3.7-plus"

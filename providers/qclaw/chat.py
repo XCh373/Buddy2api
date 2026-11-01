@@ -93,6 +93,7 @@ def _log(api_key_info, account, model_name, stream, prompt_t, completion_t, tota
                 "account_name": account.get("name") if account else None,
                 "provider": CHANNEL_ID,
                 "model": model_name,
+                "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
                 "stream": 1 if stream else 0,
                 "prompt_tokens": prompt_t,
                 "completion_tokens": completion_t,
@@ -134,7 +135,8 @@ async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
 
     tried: set[int] = set()
     last_error = None
-    for attempt in range(3):
+    max_attempts = auth_manager.account_attempt_limit(CHANNEL_ID)
+    for attempt in range(max_attempts):
         account = auth_manager.pick_account(tried, provider=CHANNEL_ID)
         if not account:
             break
@@ -177,9 +179,9 @@ async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
         last_error = ("error", (status, detail))
         _log(
             api_key_info, account, model_name, False,
-            0, 0, 0, "retry" if status in RETRYABLE_STATUS and attempt < 2 else "error",
+            0, 0, 0, "retry" if status in RETRYABLE_STATUS and attempt < max_attempts - 1 else "error",
             status, str(detail)[:400], t0,
-            increment_usage=status not in RETRYABLE_STATUS or attempt == 2,
+            increment_usage=status not in RETRYABLE_STATUS or attempt == max_attempts - 1,
         )
         if status not in RETRYABLE_STATUS:
             return last_error
@@ -193,7 +195,8 @@ async def _stream(body: dict, raw: str, api_key_info, model_name: str) -> AsyncG
     tried: set[int] = set()
     last_error = b"data: {\"error\":{\"message\":\"No available accounts\"}}\n\n"
     last_status = 503
-    for attempt in range(3):
+    max_attempts = auth_manager.account_attempt_limit(CHANNEL_ID)
+    for attempt in range(max_attempts):
         account = auth_manager.pick_account(tried, provider=CHANNEL_ID)
         if not account:
             break

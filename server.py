@@ -1156,6 +1156,53 @@ async def admin_apply_update(authorization: str | None = Header(default=None)):
         self_update.schedule_restart()
     return result
 
+_SERVER = None
+_SHUTDOWN_STARTED = False
+
+
+def bind_runtime_server(server) -> None:
+    global _SERVER
+    _SERVER = server
+
+
+def reset_shutdown_state() -> None:
+    global _SHUTDOWN_STARTED
+    _SHUTDOWN_STARTED = False
+
+
+def schedule_shutdown(delay: float = 0.4) -> dict:
+    """Stop this process after the response is sent. Does not change Git or Docker."""
+    if self_update.in_docker():
+        return {
+            "ok": False,
+            "message": "Docker 部署请在宿主机执行 docker compose stop。容器自动重启时，管理页关不掉它",
+        }
+    global _SHUTDOWN_STARTED
+    if not _SHUTDOWN_STARTED:
+        _SHUTDOWN_STARTED = True
+        threading.Thread(target=_shutdown_after, args=(delay,), daemon=True).start()
+    return {
+        "ok": True,
+        "message": "正在关闭 Buddy2api。页面即将打不开，下次请重新运行 start.bat",
+    }
+
+
+def _shutdown_after(delay: float) -> None:
+    time.sleep(max(0.0, delay))
+    server = _SERVER
+    if server is not None:
+        server.should_exit = True
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    os._exit(0)
+
+
+@app.post("/admin/shutdown")
+async def admin_shutdown(authorization: str | None = Header(default=None)):
+    _check_admin(authorization)
+    return schedule_shutdown()
+
 
 @app.get("/admin/automation-logs")
 async def admin_automation_logs(
@@ -1647,6 +1694,7 @@ def main():
 
     config = uvicorn.Config(app, host=host, port=args.port, log_level=args.log_level, proxy_headers=False)
     server = uvicorn.Server(config)
+    bind_runtime_server(server)
     if local_host and not args.no_browser:
         threading.Thread(target=_open_when_ready, args=(server, url), daemon=True).start()
     try:

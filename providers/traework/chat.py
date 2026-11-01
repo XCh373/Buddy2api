@@ -350,7 +350,8 @@ def _log(api_key_info, account, model_name, stream, finish, status, error, t0, u
                 "account_id": account["id"] if account else None,
                 "account_name": account.get("name") if account else None,
                 "provider": CHANNEL_ID,
-                "model": model_name,
+                "model": (api_key_info or {}).get("_log_model", model_name),
+                "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
                 "stream": 1 if stream else 0,
                 "prompt_tokens": usage.get("prompt_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens", 0),
@@ -507,7 +508,8 @@ async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
     tried: set[int] = set()
     last_error = None
     refreshed: set[int] = set()
-    for _ in range(3):
+    max_attempts = auth_manager.account_attempt_limit(CHANNEL_ID, refresh_retry=True)
+    for _ in range(max_attempts):
         account = await _pick(tried)
         if not account:
             break

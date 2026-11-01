@@ -337,3 +337,40 @@ def test_claim_posts_only_claimable_benefit(isolated_db, monkeypatch):
     assert result["credit"] == 100
     assert posts[0][0].endswith("/sash/api/v1/me/campaigns/act-9/claim")
     assert posts[0][1] == {}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_qoder_failover_reaches_fifth_account(isolated_db, monkeypatch, stream):
+    import httpx
+    from providers.qoder import chat
+    accounts = [db.add_account({"name": str(i), "uid": str(i), "provider": "qoder"}) for i in range(5)]
+    visited = []
+
+    async def pick(channel, excluded):
+        return next((db.get_account(aid) for aid in accounts if aid not in excluded), None)
+
+    def signed(account, channel, raw):
+        return "https://upstream.test/chat", {"X-Account": str(account["id"])}, b"{}"
+
+    def respond(request):
+        aid = int(request.headers["X-Account"])
+        visited.append(aid)
+        if aid != accounts[-1]:
+            return httpx.Response(503, text="unavailable")
+        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"fifth"}}]}\n\n')
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(chat, "_pick", pick)
+    monkeypatch.setattr(chat, "_signed_request", signed)
+    monkeypatch.setattr(chat.httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(respond)))
+    monkeypatch.setattr(chat.auth_manager, "mark_account_failure", lambda *args: None)
+    monkeypatch.setattr(chat.auth_manager, "mark_account_success", lambda *args: None)
+
+    async def run():
+        result = await chat.chat_completions("qoder", {"model": "auto", "messages": [{"role": "user", "content": "ping"}], "stream": stream}, None)
+        if stream:
+            return b"".join([chunk async for chunk in result[1]]).decode()
+        assert result[0] == "json"
+        return result[1]["choices"][0]["message"]["content"]
+    assert "fifth" in asyncio.run(run())
+    assert visited == accounts

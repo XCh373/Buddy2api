@@ -443,7 +443,7 @@ def test_web_has_update_controls():
     assert "/admin/version" in html
     assert "/admin/update" in html
     assert "更新到 v" in html
-    assert "一键更新到 v" in html
+    assert "check-cta" in html
     assert "检查更新" in html
     assert "暂时查不到远端版本" in html
     assert "测试模式" in html

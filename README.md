@@ -4,11 +4,11 @@
 
 > 把本机已经登录的消费级 AI 客户端，接成 OpenAI 兼容接口，给 Codex、OpenCode、Cherry Studio、NextChat 等用。默认打开 Work Buddy / CodeBuddy、Qoder、千问办公（QwenWork）、TraeWork、讯飞 Loomy、商汤小浣熊；管理页下拉选其中一个。一次请求只走一个通道。QClaw 已停止运营，通道已下架，积分请改用 WorkBuddy。
 
-当前版本 **2.2.9**。默认通道含 WorkBuddy 国内/国际、Qoder 中国/国际、千问办公、TraeWork、Loomy、小浣熊。没有登录凭证的渠道不会出现在模型列表里。这个项目只供你本人持有的账号在本机使用。不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
+当前版本 **2.2.13**。默认通道含 WorkBuddy 国内/国际、Qoder 中国/国际、千问办公、TraeWork、Loomy、小浣熊。没有登录凭证的渠道不会出现在模型列表里。这个项目只供你本人持有的账号在本机使用。不要公开部署，也不要把登录凭据、API Key、数据库文件发给别人。
 
 **仅限自己的账号。严禁使用接码平台、批量注册或任何批量方式薅羊毛。** 不要把网关公开给别人用，也不要代领或倒卖额度。
 
-默认本机启动会自动打开管理页，无需填写管理 Token，重启后已有页面仍可直接使用。重复启动会打开已运行的同一实例；同一数据库不能同时由多个实例使用。后台服务可加 `--no-browser`。`start.sh` 和 `start-launchd.sh` 与直接运行 `python server.py` 一样，不会自动读取 `.admin_token` 文件；显式传入 `--admin-token` 或设置 `CB_GATEWAY_ADMIN_TOKEN` 才启用令牌鉴权，非本机监听必须配置。启用令牌模式后需在管理页设置中填写。客户端 API Key 和上游账号授权不受影响。
+默认本机启动会自动打开管理页，无需填写管理 Token，重启后已有页面仍可直接使用。重复启动会打开已运行的同一实例；同一数据库不能同时由多个实例使用。后台服务可加 `--no-browser`。显式设置 `--admin-token` 或 `CB_GATEWAY_ADMIN_TOKEN` 时启用凭证管理模式；非本机监听必须设置该凭证，并在管理页设置中填写。客户端 API Key 和上游账号授权不受影响。
 
 ## 这是什么？
 
@@ -18,7 +18,7 @@ Buddy2api 在本机提供 `http://127.0.0.1:8787/v1`。你在官方客户端里�
 
 Qoder 中国版读 `%APPDATA%\com.qodercn.app.stable\auth.v1.dat`，国际版读 `%APPDATA%\com.qoder.app.stable\auth.v1.dat`。两边的登录文件、模型目录和令牌不共用。额度在领取结果和官方余额里看。工具调用交回本机客户端。
 
-讯飞 Loomy 读本机 `auth-session.json`。每日额度由上游自动发放，一键领取只核对到账余额；长对话发送前按 16 万 token 预算裁旧历史。商汤小浣熊读本机 `auth.json`，一键领取会触发每日发放。两家都用自己的请求头，不走 WorkBuddy 的 CLI 指纹。
+讯飞 Loomy 读本机 `auth-session.json`。每日额度由上游自动发放，一键领取只核对到账余额；长对话发送前按 16 万 token 预算裁旧历史。商汤小浣熊读本机 `auth.json`，一键领取会触发每日发放。新版客户端在 `%USERPROFILE%\.office-raccoon\agent\config\auth.json`，旧版 `%USERPROFILE%\.box-agent\config\auth.json` 仍会扫描。文件里没有用户编号时，按登录 token 的用户标识分开保存；换号后再导入不会覆盖已经导入的另一个号。官方客户端如果在退出时作废旧登录，已保存的号仍会失效，需要在那个号还登录着的时候导入。两家都用自己的请求头，不走 WorkBuddy 的 CLI 指纹。
 
 ```powershell
 python server.py
@@ -33,7 +33,7 @@ python server.py
 | 千问办公 QwenWork | 开 | `%APPDATA%\QwenWorkCN` |
 | TraeWork | 开 | `%APPDATA%\TRAE SOLO CN\User\globalStorage`，新装 Trae 也扫 `%APPDATA%\Trae CN\User\globalStorage` |
 | 讯飞 Loomy | 开 | `%PUBLIC%\Loomy\*\userData\auth-session.json` |
-| 商汤小浣熊 | 开 | `%USERPROFILE%\.box-agent\config\auth.json` |
+| 商汤小浣熊 | 开 | `%USERPROFILE%\.office-raccoon\agent\config\auth.json`，旧版仍读 `%USERPROFILE%\.box-agent\config\auth.json` |
 
 路径不对时可用 `CB_AUTH_DIR`、`CB_QODER_USER_DATA_DIR`、`CB_QODER_I_USER_DATA_DIR`、`CB_QWENWORK_AUTH_DIR`、`CB_TRAEWORK_AUTH_DIR`、`CB_LOOMY_AUTH_DIR`、`CB_XHX_AUTH_DIR` 指定。各通道的登录文件不要混在同一个目录。只要其中一家时，可设 `CB_GATEWAY_PROVIDERS=workbuddy` 收窄。
 
@@ -46,8 +46,6 @@ python server.py
 3. **某个通道返回 503 `channel_unavailable`：** 这个通道还没导入可用账号。
 4. **QwenWork 请在 Windows 上直接跑 `python server.py`。** Linux Docker 读不了它用 DPAPI 加密的本机文件；管理页会写明这一点。WorkBuddy 可以继续用 Docker。
 5. 本项目和聊天客户端最好在同一台电脑。客户端如果跑在 Docker 里，Base URL 填 `http://host.docker.internal:8787/v1`，不要填容器自己的 `127.0.0.1`。
-
-WorkBuddy 5.6+ 会把 `.info` 登录快照中的敏感字段加密。检测和手动添加会尝试通过本机已安装的 WorkBuddy 解密；如果无法读取本机密钥，该快照会显示为无效或无法导入。检测列表会按通道和 UID 合并同一账号的历史快照，默认显示最新一条，旧快照仍可展开查看。
 
 ## 安装与启动
 
@@ -94,7 +92,7 @@ python server.py
 http://127.0.0.1:8787
 ```
 
-停止服务：回到终端按 `Ctrl+C`。下次开机后：
+停止服务：回到终端按 `Ctrl+C`。一键更新后如果没有黑色窗口，点管理页右上角的「关闭」。下次开机后：
 
 ```powershell
 cd <你的项目路径>\Buddy2api
@@ -106,38 +104,38 @@ python server.py
 
 ### Docker
 
-本 fork 默认从源码构建，以保留会话亲和等自定义功能；下面的上游镜像不包含这些功能。上游官方镜像只发到 GitHub Container Registry，不发 Docker Hub。地址是 `ghcr.io/wicm84266964/buddy2api`，目前只有 `linux/amd64`。正式版发版成功后会推送同名标签，例如 `ghcr.io/wicm84266964/buddy2api:v2.2.9`，并移动 `latest`。预发布不移动 `latest`。请固定版本标签，不要默认追踪 `latest`。
+官方镜像只发到 GitHub Container Registry，不发 Docker Hub。地址是 `ghcr.io/wicm84266964/buddy2api`，目前只有 `linux/amd64`。正式版发版成功后会推送同名标签，例如 `ghcr.io/wicm84266964/buddy2api:v2.2.13`，并移动 `latest`。预发布不移动 `latest`。请固定版本标签，不要默认追踪 `latest`。
 
 第一次推送后，GitHub Packages 里的包可能是私有的。仓库所有者需要在包设置里把它改成公开，匿名 `docker pull` 才可用。这一步只做一次。
 
 不要把端口暴露到公网。Compose 继续只绑定 `127.0.0.1:8787`。Linux 镜像读不了 Windows DPAPI。千问办公、Loomy、小浣熊请先用本机 `python server.py` 导入，再把数据目录挂给容器。
 
-使用本 fork 源码时：
+已克隆仓库、想用预构建镜像时：
 
 ```powershell
 $env:CB_GATEWAY_ADMIN_TOKEN="cb-admin-请换成足够长的随机值"
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-`docker-compose.yml` 仅使用 `build: .`，不会默认拉取上游镜像；Windows 脚本同样从本地源码构建。
+`docker-compose.yml` 钉住当前版本，并保留 `build: .`。想用仓库源码时，继续用下面的 Windows 脚本，或执行 `docker compose up -d --build`。
 
-仅需上游功能、不克隆源码时：
+不克隆源码时：
 
 ```powershell
-docker pull ghcr.io/wicm84266964/buddy2api:v2.2.9
+docker pull ghcr.io/wicm84266964/buddy2api:v2.2.13
 docker run -d --name buddy2api --restart unless-stopped `
   -p 127.0.0.1:8787:8787 `
   -v buddy2api-data:/app/data `
   -e CB_GATEWAY_ADMIN_TOKEN="cb-admin-请换成足够长的随机值" `
   -e CB_DOCKER=1 `
-  ghcr.io/wicm84266964/buddy2api:v2.2.9
+  ghcr.io/wicm84266964/buddy2api:v2.2.13
 ```
 
 ### 其他启动方式
 
-- **脚本：** Windows 安装 Python 时勾选 Add Python to PATH，在项目目录执行 `.\start.bat`。Linux / macOS：`chmod +x start.sh && ./start.sh`。脚本优先用名为 `buddy2api` 的 Conda 环境，没有 Conda 才建 `.venv`；本机默认管理方式与直接运行 `python server.py` 一致。
-- **Docker：** `powershell -ExecutionPolicy Bypass -File .\start-docker-win.ps1`。容器支持 README 所列通道；本机没有 WorkBuddy 登录目录时脚本仍会启动。QClaw、QwenWork 和 Loomy 的本机登录文件请用上面的 `python server.py` 导入；Docker 容器无法解密 QwenWork 的 Windows DPAPI 文件。TraeWork 登录文件不是 DPAPI，本机导入后 Docker 也能使用数据库里的 token。
-
+- **脚本：** Windows 安装 Python 时勾选 Add Python to PATH，在项目目录执行 `.\start.bat`。Linux / macOS：`chmod +x start.sh && ./start.sh`。脚本优先用名为 `buddy2api` 的 Conda 环境，没有 Conda 才建 `.venv`。
+- **Docker：** 预构建镜像见上方「Docker」。`powershell -ExecutionPolicy Bypass -File .\start-docker-win.ps1` 仍在本机构建源码，不拉取 GHCR。本机没有 WorkBuddy 登录目录时脚本仍会启动。容器里通道都在，但千问办公、Loomy、小浣熊的本机登录文件请用上面的 `python server.py` 导入。导入后库里的 token 可以继续给 Docker 用。
 
 ### 第一次打开网页之后
 
@@ -151,6 +149,10 @@ docker run -d --name buddy2api --restart unless-stopped `
    - API Key：刚复制的 Key
    - 模型：WorkBuddy、Loomy、小浣熊用 `auto`；Qoder 用 `auto` 或 `Qwen3.8-Flash`；千问办公用 `auto` 或 `qwork-advanced`；TraeWork 用 `auto` 或 `qwen-3.7-plus`。上游加了新模型时，到「模型配置」点「一键读取供应模型」；各通道目录分开保存，选错通道仍会 400/403。Qoder 的额度在领取结果和官方余额里看。Loomy 的每日额度由上游自动发放，一键领取会读到账余额。小浣熊的一键领取会触发每日发放。
 
+账号页的「保存全部修改」会保存所有已编辑账号（包括被筛选隐藏的行）；失败的账号保留未保存状态，可以重试。单条保存也会保留其他行的编辑。
+
+自动通道 Key 发送裸别名或 `auto` 时，会在支持该模型的通道中，选择启用账号最高优先级最大的通道；优先级数字越大越先用，同级保持默认通道顺序。绑定通道的 Key 和 `通道/模型` 仍固定使用指定通道。可重试错误会遍历该通道的账号池，不再限于三个账号；不可重试错误和已经开始输出的流式响应仍遵守各通道的停止规则。请求日志显示「别名 → 通道 / 真实模型」，也可按真实模型搜索；旧日志不补填映射。
+
 管理页打不开或要远程访问时：
 
 ```powershell
@@ -160,8 +162,7 @@ python server.py
 
 ### 更新
 
-管理页后台自动检查版本时优先走 jsDelivr，并使用短期缓存。手动点击「检查更新」及一键更新前的复核，会直接核对配置仓库 `main` 的 GitHub Contents API；API 不可用时再尝试 GitHub raw。两种权威来源都不可用时显示「暂时查不到远端版本」，不会用 CDN 旧缓存确认已是最新。本 fork 默认检查 `XCh373/Buddy2api` 的 `main`；可通过环境变量 `CB_GATEWAY_UPDATE_REPO=owner/repo` 覆盖检查源。发现新版本后，顶栏出现「更新到 vx.y.z」，点一下会对当前分支配置的跟踪远端执行 `git pull --ff-only`、安装依赖并重启；本 fork 的 `main` 应跟踪 `origin/main`，且 `origin` 应指向你的 fork。检查源和实际拉取远端需要保持一致。拉取与安装沿用已有的 `HTTPS_PROXY`、`ALL_PROXY` 或系统代理里的明确地址，不写死端口、不改 Git 配置；只有 PAC 而没有明确地址时仍会直连。Docker、不是 git 克隆、或不在 `main` 上时，按钮会说明原因，仍可用下面的手动步骤。本机已是最新、只想看按钮时：`$env:CB_GATEWAY_FAKE_LATEST="9.9.9"` 再启动，点下去不会真的拉取或重启。
-
+管理页打开后会在后台核对远端版本（优先走 jsDelivr，不挡页面）。有新版本时顶栏出现「更新到 vx.y.z」，点一下会 `git pull --ff-only`、安装依赖并重启。这次拉取和安装会沿用已有的 `HTTPS_PROXY`、`ALL_PROXY`，或系统代理里的明确地址；不写死端口，也不改 Git 配置。只填了自动配置脚本（PAC）、没有具体地址时，Git 仍会直连。查不到远端版本时不会报错。Docker、不是 git 克隆、或不在 `main` 上时，按钮会说明原因，仍可用下面的手动步骤。Docker 安装请拉取 compose 钉住的版本后重启：`docker compose pull`，然后 `docker compose up -d`。本机已是最新、只想看按钮时：`$env:CB_GATEWAY_FAKE_LATEST="9.9.9"` 再启动，点下去不会真的拉取或重启。
 
 先 `Ctrl+C` 停掉正在跑的服务：
 
@@ -273,18 +274,6 @@ QwenWork、TraeWork、Loomy、小浣熊各用自己那把 Key，不要混用。�
 | `--no-admin-auth` | 关 | 显式启用本机自动授权，仍校验请求来源；只允许回环监听 |
 | `--no-browser` | 关 | 不自动打开浏览器，适合后台服务 |
 
-## 临期额度优先路由
-
-另有可选的[独立会话账号亲和](docs/design/session-affinity.md)，默认关闭，仅适用 WorkBuddy 国内/国际账号池。启用后，同一可靠会话优先保留仍可用且属于最高人工优先级组的绑定，再为新会话或失效绑定使用临期和原通道规则。客户端可通过独立显式头接入，无需任何前置代理；亲和不保证缓存命中或消息串行。
-
-管理页“设置 → WorkBuddy 账号路由”可以启用“临期额度优先”，默认仍使用现有策略。同一手动优先级内，优先使用更早到期的可用额度包所在账号；手动优先级始终优先。相同到期时间保留账号粘性，其他通道不受影响。
-
-默认临期窗口为 30 天，后台每 120 秒刷新额度，缓存超过 300 秒、查询失败或额度已被本地消耗抵扣时取消临期加成。没有可信临期额度时回到现有路由。关闭策略后不再发起策略专用后台查询。后台额度查询可能刷新账号凭据，因此同一个上游账号在多个实例中运行时仍可能相互影响。
-
-设置中的“预览已保存的路由策略”可以查看预计账号、临期时间、保守剩余额度与降级原因，不会切换账号或刷新额度。实际账号内扣哪个额度包由上游决定；本地消耗抵扣是保守估计，无法精确覆盖其他客户端用量或尚未落账的并发请求。这里的临期指额度包，不是 Token 有效期。
-
-详细设计见 [开发方案](docs/design/expiry-priority-routing.md)。
-
 ## 环境变量
 
 | 变量 | 说明 |
@@ -305,7 +294,7 @@ QwenWork、TraeWork、Loomy、小浣熊各用自己那把 Key，不要混用。�
 | `CB_LOOMY_AUTH_DIR` | Loomy 数据根目录，下面应有 `*/userData/auth-session.json` |
 | `CB_LOOMY_CONTEXT_BUDGET` | Loomy 发送前上下文预算，默认 `160000`。`0` 关闭发送前裁剪 |
 | `CB_GATEWAY_MAX_BODY_BYTES` | 请求体上限，默认 `33554432`（32 MiB） |
-| `CB_XHX_AUTH_DIR` | 小浣熊 `auth.json` 所在目录或文件 |
+| `CB_XHX_AUTH_DIR` | 小浣熊 `auth.json` 所在目录或文件。不设时扫描新版 `.office-raccoon\agent\config\auth.json` 和旧版 `.box-agent\config\auth.json` |
 | `CB_HOST_AUTH_DIR` | Docker 脚本用的本机 WorkBuddy 目录 |
 | `CB_GATEWAY_ADMIN_TOKEN` | 固定管理 Token |
 | `CB_GATEWAY_DB_PATH` | 数据库路径 |

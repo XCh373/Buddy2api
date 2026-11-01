@@ -17,17 +17,30 @@ class XiaohuanxiongAuthError(RuntimeError):
     pass
 
 
-def jwt_exp_ms(token: str) -> int:
+def jwt_payload(token: str) -> dict:
     try:
         parts = (token or "").split(".")
         if len(parts) < 2:
-            return 0
+            return {}
         payload = parts[1] + "=" * (-len(parts[1]) % 4)
         data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
-        exp = int(data.get("exp") or 0)
-        return exp * 1000 if exp < 10_000_000_000 else exp
+        return data if isinstance(data, dict) else {}
     except Exception:
+        return {}
+
+
+def jwt_exp_ms(token: str) -> int:
+    try:
+        exp = int(jwt_payload(token).get("exp") or 0)
+    except (TypeError, ValueError):
         return 0
+    if exp <= 0:
+        return 0
+    return exp * 1000 if exp < 10_000_000_000 else exp
+
+
+def jwt_sub(token: str) -> str:
+    return str(jwt_payload(token).get("sub") or "").strip()
 
 
 def is_token_expired(account: dict, skew_seconds: int = REFRESH_MARGIN_SECONDS) -> bool:

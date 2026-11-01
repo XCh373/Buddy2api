@@ -339,6 +339,7 @@ def _log(channel, api_key_info, account, model_name, finish_reason, status_code,
                 "account_name": (account.get("name") or account.get("nickname")) if account else None,
                 "provider": channel,
                 "model": model_name,
+                "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
                 "stream": 1,
                 "prompt_tokens": 0,
                 "completion_tokens": max(1, text_len // 4) if text_len else 0,
@@ -375,7 +376,8 @@ async def _stream(channel: str, raw: str, model: str, api_key_info, model_name) 
     tried: set[int] = set()
     last = "没有可用的 Qoder 账号"
     shown = model_name or model
-    for _attempt in range(3):
+    max_attempts = auth_manager.account_attempt_limit(channel)
+    for _attempt in range(max_attempts):
         account = await _pick(channel, tried)
         if not account:
             break

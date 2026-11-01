@@ -243,35 +243,31 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
 
     account = data.get("account", {}) if isinstance(data, dict) else {}
     auth = data.get("auth", {}) if isinstance(data, dict) else {}
-    token = _decrypt_field(auth.get("accessToken"))
-    if not token:
-        meta["reason"] = "未发现 accessToken 或解密失败"
+    if not isinstance(account, dict) or not isinstance(auth, dict):
+        meta["reason"] = "account/auth 必须是 JSON 对象"
+        return meta
+    if not auth.get("accessToken"):
+        meta["reason"] = "未发现 accessToken"
         return meta
 
-    uid = _decrypt_field(account.get("uid"))
-    nickname = _decrypt_field(account.get("nickname"))
+    uid = account.get("uid", "")
+    # 昵称在建号时也可能是 at-rest 信封（国内版），展示前先解出来；解不出来就退回文件名。
+    shown, atrest_err = resolve_atrest_fields({
+        "nickname": account.get("nickname", ""),
+        "phone": account.get("phoneNumber", ""),
+        "access_token": auth.get("accessToken", ""),
+        "refresh_token": auth.get("refreshToken", ""),
+    })
     meta.update({
-        "valid": True,
-        "reason": "ok",
-        "account_name": nickname or path.stem,
+        "valid": bool(shown.get("access_token")) and not atrest_err,
+        "reason": atrest_err or ("ok" if shown.get("access_token") else "未发现可用 accessToken"),
+        "account_name": shown.get("nickname") or path.stem,
         "uid_masked": _mask_value(uid),
-        "domain": _decrypt_field(auth.get("domain")) or DEFAULT_DOMAIN,
+        "domain": auth.get("domain", DEFAULT_DOMAIN) or DEFAULT_DOMAIN,
         "expires_at": auth.get("expiresAt", 0) if isinstance(auth.get("expiresAt"), (int, float)) else 0,
         "already_imported": bool(uid and uid in existing_uids),
     })
     return meta
-
-
-def _decrypt_field(value) -> str:
-    """Return plaintext WorkBuddy values, decrypting 5.6+ envelope fields."""
-    if isinstance(value, str):
-        return value
-    if wb_atrest is not None and wb_atrest.is_encrypted_field(value):
-        try:
-            return wb_atrest.decrypt_auth_field(value)
-        except Exception:
-            return ""
-    return ""
 
 
 def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
@@ -315,6 +311,58 @@ def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
     }
 
 
+def _atrest():
+    """懒加载 wb_atrest（桌面端 at-rest 信封解密），不可用时返回 None。"""
+    try:
+        import wb_atrest  # 本机可选模块，仓库里随 wb_switch 一起带
+        return wb_atrest
+    except Exception:
+        return None
+
+
+def resolve_atrest_fields(values: dict) -> tuple[dict, str]:
+    """把桌面端 at-rest 信封（{"$wbEncrypted":1,"envelope":".."}）解成明文。
+
+    非信封字段原样返回；拿到密钥失败时信封字段一律置空，调用方按「无可用凭据」
+    处理。★绝不能把信封 dict 交给下游 credential_crypto（会 AttributeError 崩扫描）。
+    密钥来源：正在运行的 WorkBuddy 客户端进程内存，回收一次后进程内缓存。
+    """
+    # 所有出口都只允许字符串进入凭据存储，包括不完整的信封或其他异常 JSON 值。
+    plain = {k: v if isinstance(v, str) else "" for k, v in values.items()}
+    mod = _atrest()
+    if mod is None:
+        encrypted = any(isinstance(v, dict) and "$wbEncrypted" in v
+                        or isinstance(v, str) and "$wbEncrypted" in v
+                        for v in values.values())
+        return (
+            {k: ("" if isinstance(v, str) and "$wbEncrypted" in v else plain[k])
+             for k, v in values.items()},
+            "未找到 wb_atrest 模块" if encrypted else "",
+        )
+    if not any(mod.is_envelope(v) for v in values.values()):
+        return plain, ""
+    try:
+        # wb_atrest 负责唯一的密钥缓存，并在每次使用前校验当前 keyblob。
+        key = mod.recover_key()
+    except Exception as exc:
+        return (
+            {k: ("" if mod.is_envelope(v) else plain[k]) for k, v in values.items()},
+            f"at-rest 密钥回收失败（客户端没在跑？）: {exc}",
+        )
+    out = {}
+    errors = []
+    for name, value in values.items():
+        if mod.is_envelope(value):
+            try:
+                out[name] = mod.decrypt_field(key, value) or ""
+            except Exception as exc:
+                errors.append(f"{name} 解密失败: {exc}")
+                out[name] = ""
+        else:
+            out[name] = value if isinstance(value, str) else ""
+    return out, "; ".join(errors)
+
+
 def parse_auth_file(path: Path) -> Optional[dict]:
     """解析 auth 文件，返回结构化凭据。"""
     try:
@@ -323,37 +371,66 @@ def parse_auth_file(path: Path) -> Optional[dict]:
     except (json.JSONDecodeError, OSError):
         return None
 
+    if not isinstance(data, dict):
+        return None
     account = data.get("account", {})
     auth = data.get("auth", {})
-    token = _decrypt_field(auth.get("accessToken"))
-    if not token:
+    if not isinstance(account, dict) or not isinstance(auth, dict):
+        return None
+    if not auth.get("accessToken"):
         return None
 
+    # ★2026-10-26: 桌面端自 2026-09-24 起把 accessToken/refreshToken（国内版还有
+    # nickname/phoneNumber）写成 at-rest 信封 → 必须先解密，否则下游 encrypt_secret
+    # 收到 dict 抛 AttributeError（/admin/accounts/scan 500），或把信封当 token 存进去
+    # 导致每个请求 401。
+    fields, _err = resolve_atrest_fields(
+        {
+            "nickname": account.get("nickname", ""),
+            "phone": account.get("phoneNumber", ""),
+            "access_token": auth.get("accessToken", ""),
+            "refresh_token": auth.get("refreshToken", ""),
+        }
+    )
+    if _err or not fields.get("access_token"):
+        return None
+    session_state = auth.get("sessionState", "")
+    if not isinstance(session_state, str):
+        session_state = ""
+
     return {
-        "name": _decrypt_field(account.get("nickname")) or path.stem,
-        "uid": _decrypt_field(account.get("uid")),
-        "nickname": _decrypt_field(account.get("nickname")),
-        "phone": _decrypt_field(account.get("phoneNumber")),
+        "name": fields.get("nickname") or path.stem,
+        "uid": account.get("uid", ""),
+        "nickname": fields.get("nickname", ""),
+        "phone": fields.get("phone", ""),
         "account_type": account.get("type", "personal"),
-        "access_token": token,
-        "refresh_token": _decrypt_field(auth.get("refreshToken")),
+        "access_token": fields.get("access_token", ""),
+        "refresh_token": fields.get("refresh_token", ""),
         "expires_at": auth.get("expiresAt", 0),
         "refresh_expires_at": auth.get("refreshExpiresAt", 0),
-        "domain": _decrypt_field(auth.get("domain")) or DEFAULT_DOMAIN,
-        "enterprise_id": _decrypt_field(account.get("enterpriseId")),
-        "session_state": _decrypt_field(auth.get("sessionState")),
+        "domain": auth.get("domain", DEFAULT_DOMAIN),
+        "enterprise_id": account.get("enterpriseId", ""),
+        "session_state": session_state,
     }
 
 
 def parse_account_payload(data: dict, name: str = "") -> Optional[dict]:
-    """Parse nested WorkBuddy auth JSON or its flattened UI representation."""
+    """Parse nested WorkBuddy auth JSON or its flattened UI representation.
+
+    Fork addition: accepts both the nested ``{"auth":..,"account":..}`` shape and
+    the flattened UI shape, and decrypts desktop at-rest envelopes through
+    ``resolve_atrest_fields`` (upstream's single decryption seam).
+    """
     if not isinstance(data, dict):
         return None
     auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
     account = data.get("account") if isinstance(data.get("account"), dict) else {}
 
-    def pick(nested: dict, nested_key: str, flat_key: str) -> str:
-        return _decrypt_field(data.get(flat_key)) or _decrypt_field(nested.get(nested_key))
+    def raw(nested: dict, nested_key: str, flat_key: str):
+        value = data.get(flat_key)
+        if value is None:
+            value = nested.get(nested_key)
+        return value if value is not None else ""
 
     def number(nested: dict, nested_key: str, flat_key: str):
         for source, key in ((data, flat_key), (nested, nested_key)):
@@ -362,26 +439,34 @@ def parse_account_payload(data: dict, name: str = "") -> Optional[dict]:
                 return value
         return 0
 
-    access_token = pick(auth, "accessToken", "access_token")
-    if not access_token:
+    fields, err = resolve_atrest_fields({
+        "access_token": raw(auth, "accessToken", "access_token"),
+        "refresh_token": raw(auth, "refreshToken", "refresh_token"),
+        "nickname": raw(account, "nickname", "nickname"),
+        "phone": raw(account, "phoneNumber", "phone"),
+        "domain": raw(auth, "domain", "domain"),
+        "enterprise_id": raw(account, "enterpriseId", "enterprise_id"),
+        "session_state": raw(auth, "sessionState", "session_state"),
+    })
+    if err or not fields.get("access_token"):
         return None
-    nickname = pick(account, "nickname", "nickname")
+    nickname = fields.get("nickname") or ""
     account_type = account.get("type") or data.get("account_type") or "personal"
     if not isinstance(account_type, str):
         account_type = "personal"
     return {
         "name": (name or data.get("name") or "").strip() or nickname,
-        "uid": pick(account, "uid", "uid"),
+        "uid": raw(account, "uid", "uid") or "",
         "nickname": nickname,
-        "phone": pick(account, "phoneNumber", "phone"),
+        "phone": fields.get("phone") or "",
         "account_type": account_type,
-        "access_token": access_token,
-        "refresh_token": pick(auth, "refreshToken", "refresh_token"),
+        "access_token": fields["access_token"],
+        "refresh_token": fields.get("refresh_token") or "",
         "expires_at": number(auth, "expiresAt", "expires_at"),
         "refresh_expires_at": number(auth, "refreshExpiresAt", "refresh_expires_at"),
-        "domain": pick(auth, "domain", "domain") or DEFAULT_DOMAIN,
-        "enterprise_id": pick(account, "enterpriseId", "enterprise_id"),
-        "session_state": pick(auth, "sessionState", "session_state"),
+        "domain": fields.get("domain") or DEFAULT_DOMAIN,
+        "enterprise_id": fields.get("enterprise_id") or "",
+        "session_state": fields.get("session_state") or "",
     }
 
 
@@ -1235,6 +1320,17 @@ def workbuddy_channel_for_domain(domain: str) -> str:
     if host == "workbuddy.ai" or host.endswith(".workbuddy.ai"):
         return "workbuddy-i"
     return "workbuddy"
+
+
+def account_attempt_limit(provider: str, *, refresh_retry: bool = False) -> int:
+    """Budget for the whole channel pool, including refreshable expired accounts.
+
+    Keep the existing minimum for refresh attempts; never cap a larger pool at three.
+    TraeWork may retry each account once after renewing its credentials.
+    """
+    count = sum(a.get("status") in {"active", "expired"}
+                for a in db.list_accounts(provider=provider))
+    return max(3, count * (2 if refresh_retry else 1))
 
 
 def pick_account(

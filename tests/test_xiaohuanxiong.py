@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -9,6 +10,7 @@ import database as db
 from providers.xiaohuanxiong.headers import client_headers
 from providers.xiaohuanxiong.models import parse_supplier_models
 from providers.xiaohuanxiong.quota import _today_points, parse_balance, parse_bills
+from providers.xiaohuanxiong import store
 from providers.xiaohuanxiong.store import session_to_account
 
 
@@ -133,6 +135,7 @@ def _patch_upstream(monkeypatch, responses):
     from providers.xiaohuanxiong import chat
 
     queue = list(responses)
+    monkeypatch.setattr(db, "list_accounts", lambda **kwargs: [{"id": 9, "status": "active"}])
     logs = []
 
     class Client:
@@ -251,3 +254,93 @@ def test_nonstream_retry_keeps_raw_error_then_records_success(monkeypatch):
         (502, "retry", 9, False, 0, "bad gateway"),
         (200, "stop", 9, True, 7, ""),
     ]
+
+
+def _jwt(sub: str) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode("ascii").rstrip("=")
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"sub": sub, "exp": 1893456000}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"{header}.{payload}.sig"
+
+
+def test_login_without_user_id_uses_token_subject():
+    parsed = session_to_account(
+        {
+            "access_token": _jwt("user-a"),
+            "refresh_token": "refresh-a",
+            "office_identity": "org-1",
+        }
+    )
+    assert parsed["uid"] == "user-a"
+    assert parsed["name"] == "小浣熊-er-a"
+    assert parsed["extra"]["office_identity"] == "org-1"
+
+
+def test_explicit_user_id_wins_over_token_subject():
+    parsed = session_to_account(
+        {"access_token": _jwt("user-a"), "refresh_token": "refresh-a", "user_id": "42"}
+    )
+    assert parsed["uid"] == "42"
+
+
+def test_second_login_does_not_replace_first(isolated_db):
+    first = store.upsert_account(
+        session_to_account({"access_token": _jwt("user-a"), "refresh_token": "refresh-a"})
+    )
+    second = store.upsert_account(
+        session_to_account({"access_token": _jwt("user-b"), "refresh_token": "refresh-b"})
+    )
+    assert first["updated"] is False
+    assert second["updated"] is False
+    assert first["id"] != second["id"]
+    rows = {row["uid"]: row for row in db.list_accounts(provider="xiaohuanxiong")}
+    assert rows["user-a"]["refresh_token"] == "refresh-a"
+    assert rows["user-b"]["refresh_token"] == "refresh-b"
+
+
+def test_same_subject_updates_and_legacy_generic_uid_is_adopted(isolated_db):
+    account_id = db.add_account(
+        {
+            "name": "小浣熊",
+            "nickname": "工作号",
+            "uid": "小浣熊",
+            "provider": "xiaohuanxiong",
+            "access_token": _jwt("user-a"),
+            "refresh_token": "old-refresh",
+            "expires_at": 1,
+        }
+    )
+    result = store.upsert_account(
+        session_to_account({"access_token": _jwt("user-a"), "refresh_token": "new-refresh"})
+    )
+    assert result == {"id": account_id, "updated": True}
+    row = db.get_account(account_id)
+    assert row["uid"] == "user-a"
+    assert row["refresh_token"] == "new-refresh"
+    assert row["nickname"] == "工作号"
+    other = store.upsert_account(
+        session_to_account({"access_token": _jwt("user-b"), "refresh_token": "refresh-b"})
+    )
+    assert other["updated"] is False
+    assert db.get_account(account_id)["refresh_token"] == "new-refresh"
+
+
+def test_new_client_auth_path_is_discovered(isolated_db, tmp_path, monkeypatch):
+    monkeypatch.setattr(store.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CB_XHX_AUTH_DIR", raising=False)
+    monkeypatch.delenv("CB_XIAOHUANXIONG_AUTH_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    auth = tmp_path / ".office-raccoon" / "agent" / "config" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"access_token": _jwt("user-a"), "refresh_token": "refresh-a"}),
+        encoding="utf-8",
+    )
+    found = store.discover()
+    paths = [item["path"] for item in found["files"]]
+    assert str(auth) in paths
+    assert found["valid_count"] == 1
+    parsed = store.import_discovered(str(auth))
+    assert parsed["uid"] == "user-a"
+    assert parsed["extra"]["auth_path"] == str(auth.resolve())

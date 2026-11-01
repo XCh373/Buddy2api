@@ -21,24 +21,26 @@ def isolated_db(tmp_path, monkeypatch):
     credential_crypto.reset_cache()
 
 
+TEST_KEY = bytes(range(32))
+
+
 @pytest.fixture
 def workbuddy_cipher(monkeypatch):
-    monkeypatch.setenv("WORKBUDDY_AT_REST_SECRET", "synthetic-workbuddy-test-secret")
-    monkeypatch.setattr(wb_atrest, "_cached_key", None)
+    # Upstream wb_atrest exposes a single decryption seam: recover_key() + seal().
+    monkeypatch.setattr(wb_atrest, "recover_key", lambda *a, **k: TEST_KEY)
     yield
-    monkeypatch.setattr(wb_atrest, "_cached_key", None)
 
 
 def _encrypted_auth():
     return {
         "account": {
-            "uid": wb_atrest.encrypt_auth_field("uid-test-123"),
-            "nickname": wb_atrest.encrypt_auth_field("WorkBuddy Test"),
-            "phoneNumber": wb_atrest.encrypt_auth_field("13800000000"),
+            "uid": "uid-test-123",
+            "nickname": wb_atrest.seal(TEST_KEY, "WorkBuddy Test", "field"),
+            "phoneNumber": wb_atrest.seal(TEST_KEY, "13800000000", "field"),
         },
         "auth": {
-            "accessToken": wb_atrest.encrypt_auth_field("access-token-one"),
-            "refreshToken": wb_atrest.encrypt_auth_field("refresh-token-one"),
+            "accessToken": wb_atrest.seal(TEST_KEY, "access-token-one", "field"),
+            "refreshToken": wb_atrest.seal(TEST_KEY, "refresh-token-one", "field"),
             "expiresAt": 1_900_000_000_000,
             "refreshExpiresAt": 2_000_000_000_000,
             "domain": "www.codebuddy.cn",
@@ -68,7 +70,7 @@ def test_manual_add_decrypts_and_updates_existing_workbuddy_by_uid(
     parsed = auth_manager.parse_account_payload(payload)
     first_id, first_action = auth_manager.upsert_account(parsed, "workbuddy")
 
-    payload["auth"]["accessToken"] = wb_atrest.encrypt_auth_field("access-token-two")
+    payload["auth"]["accessToken"] = wb_atrest.seal(TEST_KEY, "access-token-two", "field")
     parsed_again = auth_manager.parse_account_payload(payload)
     second_id, second_action = auth_manager.upsert_account(parsed_again, "workbuddy")
 
@@ -92,7 +94,7 @@ def test_manual_add_endpoint_decrypts_and_returns_update_status(
 
     payload = {**_encrypted_auth(), "provider": "workbuddy"}
     first = asyncio.run(post(payload))
-    payload["auth"]["accessToken"] = wb_atrest.encrypt_auth_field("access-token-two")
+    payload["auth"]["accessToken"] = wb_atrest.seal(TEST_KEY, "access-token-two", "field")
     second = asyncio.run(post(payload))
 
     assert first.status_code == second.status_code == 200

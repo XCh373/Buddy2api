@@ -369,6 +369,7 @@ def _collect_chat_proxy_stream(
             return FakeResponse()
 
     account = {"id": 1, "name": "test-account"}
+    monkeypatch.setattr(db, "list_accounts", lambda **kwargs: [account])
 
     async def pick_account(_excluded, **kwargs):
         return account
@@ -424,6 +425,7 @@ def _install_chat_account_stream_fakes(
     accounts: list[dict],
     streams: dict[int, list[bytes]],
 ) -> dict:
+    monkeypatch.setattr(db, "list_accounts", lambda **kwargs: accounts)
     calls = {
         "picks": [],
         "failures": [],
@@ -447,6 +449,10 @@ def _install_chat_account_stream_fakes(
         async def aiter_bytes(self):
             for chunk in self.chunks:
                 yield chunk
+
+        async def aiter_lines(self):
+            for line in b"".join(self.chunks).decode().splitlines():
+                yield line
 
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -3616,3 +3622,46 @@ def test_tool_loop_stop_does_not_reprompt_or_double_account(
         assert [finish for finish, _status, _error in log_terminals] == ["stop"]
         assert response["choices"][0]["finish_reason"] == "stop"
         assert response["choices"][0]["message"]["content"] == text
+
+
+def test_stream_tool_stall_is_logged(monkeypatch, isolated_db):
+    """流式停转（flag off）时日志 finish_reason 记为 tool_stall。"""
+    calls = _install_chat_account_stream_fakes(
+        monkeypatch,
+        [{"id": 1, "name": "test-account"}],
+        {1: _stall_stream_chunks()},
+    )
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    async def collect():
+        return b"".join([
+            chunk
+            async for chunk in proxy._stream_upstream(body, None, "test-model")
+        ])
+
+    raw = asyncio.run(collect())
+    assert b"tool stall" not in raw
+    logged_finishes = [entry[0][8] for entry in calls["logs"]]
+    assert "tool_stall" in logged_finishes
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_workbuddy_failover_reaches_fifth_account(isolated_db, monkeypatch, stream):
+    accounts = []
+    for index in range(5):
+        aid = db.add_account({"name": str(index), "uid": str(index), "provider": "workbuddy"})
+        accounts.append(db.get_account(aid))
+    success = _chat_sse({"choices": [{"index": 0, "delta": {"content": "fifth"}, "finish_reason": "stop"}]}) + b"data: [DONE]\n\n"
+    streams = {a["id"]: ([] if i < 4 else [success]) for i, a in enumerate(accounts)}
+    calls = _install_chat_account_stream_fakes(monkeypatch, streams=streams, accounts=accounts)
+    async def run():
+        result = await proxy.proxy_chat_completions({"model": "auto", "messages": [{"role": "user", "content": "ping"}], "stream": stream})
+        if stream:
+            return b"".join([chunk async for chunk in result[1]]).decode()
+        assert result[0] == "json"
+        return result[1]["choices"][0]["message"]["content"]
+    assert "fifth" in asyncio.run(run())
+    assert calls["successes"] == [accounts[-1]["id"]]
+    assert len(calls["picks"]) == 5
+

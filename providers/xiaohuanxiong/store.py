@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 
 import database as db
 from providers.xiaohuanxiong.constants import AUTH_FILENAME, CHANNEL_ID
-from providers.xiaohuanxiong.token import jwt_exp_ms
+from providers.xiaohuanxiong.token import jwt_exp_ms, jwt_sub
+
+_GENERIC_UIDS = {"", "小浣熊", "xiaohuanxiong", "raccoon"}
 
 
 def auth_candidates() -> list[Path]:
@@ -20,7 +23,9 @@ def auth_candidates() -> list[Path]:
     if explicit:
         target = Path(explicit).expanduser()
         paths.append(target if target.suffix.lower() == ".json" else target / AUTH_FILENAME)
-    paths.append(Path.home() / ".box-agent" / "config" / AUTH_FILENAME)
+    home = Path.home()
+    paths.append(home / ".office-raccoon" / "agent" / "config" / AUTH_FILENAME)
+    paths.append(home / ".box-agent" / "config" / AUTH_FILENAME)
     local = os.environ.get("LOCALAPPDATA", "").strip()
     if local:
         paths.append(Path(local) / "box-agent" / "config" / AUTH_FILENAME)
@@ -53,8 +58,17 @@ def session_to_account(document: dict, *, source: str = "") -> dict:
     ).strip()
     if access.lower().startswith("bearer "):
         access = access[7:].strip()
-    uid = str(document.get("user_id") or document.get("uid") or document.get("id") or nested.get("user_id") or "").strip()
-    name = str(document.get("name") or document.get("nickname") or document.get("office_org_name") or uid or "小浣熊")
+    office_identity = str(document.get("office_identity") or nested.get("office_identity") or "").strip()
+    uid = _account_uid(document, nested, access, refresh, office_identity)
+    explicit_name = str(
+        document.get("name")
+        or document.get("nickname")
+        or document.get("office_org_name")
+        or nested.get("name")
+        or nested.get("nickname")
+        or ""
+    ).strip()
+    name = explicit_name or _display_name(uid)
     if not access and not refresh:
         raise ValueError("Xiaohuanxiong auth is missing access_token and refresh_token")
     expires = document.get("expires_at") or document.get("expiresAt") or jwt_exp_ms(access)
@@ -73,8 +87,55 @@ def session_to_account(document: dict, *, source: str = "") -> dict:
         "refresh_token": refresh,
         "expires_at": expires_at,
         "status": "active",
-        "extra": {"source": source},
+        "extra": _session_extra(source, office_identity),
     }
+
+
+def _account_uid(document: dict, nested: dict, access: str, refresh: str, office_identity: str) -> str:
+    explicit = str(
+        document.get("user_id")
+        or document.get("uid")
+        or document.get("id")
+        or nested.get("user_id")
+        or nested.get("uid")
+        or nested.get("id")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+    subject = jwt_sub(access) or jwt_sub(refresh)
+    if subject:
+        return subject
+    material = refresh or access
+    if not material:
+        return ""
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    return f"{office_identity or 'tok'}-{digest}"
+
+
+def _display_name(uid: str) -> str:
+    if uid and uid not in _GENERIC_UIDS:
+        return f"小浣熊-{uid[-4:]}"
+    return "小浣熊"
+
+
+def _session_extra(source: str, office_identity: str) -> dict:
+    extra = {"source": source}
+    if office_identity:
+        extra["office_identity"] = office_identity
+    return extra
+
+
+def _legacy_same_subject(row: dict, uid: str) -> bool:
+    stored_uid = str(row.get("uid") or "")
+    if not uid or stored_uid == uid:
+        return False
+    stored_name = str(row.get("name") or "")
+    stored_nickname = str(row.get("nickname") or "")
+    generic = stored_uid in _GENERIC_UIDS or stored_uid in {stored_name, stored_nickname}
+    if not generic:
+        return False
+    return jwt_sub(str(row.get("access_token") or "")) == uid or jwt_sub(str(row.get("refresh_token") or "")) == uid
 
 
 def parse_credentials(body: dict) -> dict:
@@ -84,19 +145,34 @@ def parse_credentials(body: dict) -> dict:
 def upsert_account(parsed: dict) -> dict:
     uid = str(parsed.get("uid") or "")
     existing = None
+    rows = db.list_accounts(provider=CHANNEL_ID)
     if uid:
-        for row in db.list_accounts(provider=CHANNEL_ID):
+        for row in rows:
             if str(row.get("uid") or "") == uid:
                 existing = row
                 break
+        if existing is None:
+            for row in rows:
+                if _legacy_same_subject(row, uid):
+                    existing = row
+                    break
     if existing:
+        nickname = str(parsed.get("nickname") or "")
+        existing_name = str(existing.get("nickname") or "")
+        if existing_name and existing_name not in _GENERIC_UIDS and nickname == _display_name(uid):
+            nickname = existing_name
+        extra = dict(existing.get("extra") or {})
+        if isinstance(parsed.get("extra"), dict):
+            extra.update(parsed["extra"])
         patch = {
+            "uid": uid or existing.get("uid"),
+            "name": nickname or existing.get("name"),
             "access_token": parsed.get("access_token") or existing.get("access_token"),
             "refresh_token": parsed.get("refresh_token") or existing.get("refresh_token"),
             "expires_at": parsed.get("expires_at") or existing.get("expires_at"),
-            "nickname": parsed.get("nickname") or existing.get("nickname"),
+            "nickname": nickname or existing.get("nickname"),
             "status": "active",
-            "extra": parsed.get("extra") or existing.get("extra") or {},
+            "extra": extra,
         }
         db.update_account(existing["id"], patch)
         return {"id": existing["id"], "updated": True}

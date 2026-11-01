@@ -25,7 +25,12 @@ class CredentialCryptoError(RuntimeError):
 
 
 def is_encrypted(value: str | None) -> bool:
-    return bool(value and value.startswith(PREFIX))
+    # ★2026-10-26: 桌面端 at-rest 信封是 dict（{"$wbEncrypted":1,"envelope":..}），
+    # 不是本模块的密文。以前这里直接 startswith() 会抛 AttributeError，
+    # 把整批「扫描本机账号」带崩（/admin/accounts/scan 必 500）。
+    if not isinstance(value, str):
+        return False
+    return bool(value) and value.startswith(PREFIX)
 
 
 def _key_file(db_path: Path) -> Path:

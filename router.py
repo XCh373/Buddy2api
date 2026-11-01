@@ -46,7 +46,7 @@ def _channels_accepting(inner: str) -> list[str]:
 
 
 def _prefer_usable(candidates: list[str]) -> str:
-    """First candidate that already has an active account.
+    """Choose the channel with the highest-priority active account.
 
     Used only when an any-channel key left the channel open. Quota exhaustion
     does not count: an active account with no credits still keeps the channel.
@@ -55,13 +55,16 @@ def _prefer_usable(candidates: list[str]) -> str:
     """
     if not candidates:
         raise UnknownChannel("")
-    for channel in candidates:
+    ranked = []
+    for index, channel in enumerate(candidates):
         try:
-            if db.get_active_accounts(channel):
-                return channel
+            accounts = db.get_active_accounts(channel)
+            if accounts:
+                priority = max(int(account.get("priority") or 0) for account in accounts)
+                ranked.append((-priority, index, channel))
         except Exception:
             continue
-    return candidates[0]
+    return min(ranked)[2] if ranked else candidates[0]
 
 
 def _other_channel_ids(inner: str, except_channel: str) -> bool:
@@ -445,6 +448,7 @@ async def _chat_after_bind_no_echo(
     dispatch = clamp_output_tokens(dispatch, model)
     info = dict(api_key_info or {})
     info["_log_model"] = bound.original
+    info["_resolved_model"] = inner
     info["_bind_channel"] = bound.channel
     if affinity is not None:
         info["_session_affinity"] = affinity

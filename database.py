@@ -660,6 +660,8 @@ def _migrate_logs_provider(conn: sqlite3.Connection):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(logs)").fetchall()}
     if "provider" not in cols:
         conn.execute("ALTER TABLE logs ADD COLUMN provider TEXT")
+    if "resolved_model" not in cols:
+        conn.execute("ALTER TABLE logs ADD COLUMN resolved_model TEXT DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider)")
 
 
@@ -1195,8 +1197,8 @@ def add_log(data: dict):
             INSERT INTO logs
                 (api_key_id, api_key_name, account_id, account_name, model, stream,
                  prompt_tokens, completion_tokens, total_tokens, credit,
-                 finish_reason, duration_ms, status_code, error_msg, provider, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 finish_reason, duration_ms, status_code, error_msg, provider, resolved_model, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             data.get("api_key_id"), data.get("api_key_name"),
             data.get("account_id"), data.get("account_name"),
@@ -1206,7 +1208,7 @@ def add_log(data: dict):
             data.get("finish_reason", ""), data.get("duration_ms", 0),
             data.get("status_code", 200), data.get("error_msg", ""),
             data.get("provider") or "workbuddy",
-            now,
+            data.get("resolved_model", ""), now,
         ))
         conn.commit()
         conn.close()
@@ -1223,8 +1225,8 @@ def record_request(data: dict):
                 INSERT INTO logs
                     (api_key_id, api_key_name, account_id, account_name, model, stream,
                      prompt_tokens, completion_tokens, total_tokens, credit,
-                     finish_reason, duration_ms, status_code, error_msg, provider, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     finish_reason, duration_ms, status_code, error_msg, provider, resolved_model, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     data.get("api_key_id"), data.get("api_key_name"),
@@ -1234,7 +1236,7 @@ def record_request(data: dict):
                     data.get("total_tokens", 0), data.get("credit", 0),
                     data.get("finish_reason", ""), data.get("duration_ms", 0),
                     data.get("status_code", 200), data.get("error_msg", ""),
-                    data.get("provider") or "workbuddy", now,
+                    data.get("provider") or "workbuddy", data.get("resolved_model", ""), now,
                 ),
             )
             if data.get("account_id") and data.get("increment_usage", True):
@@ -1440,9 +1442,9 @@ def search_logs(filters: Optional[dict] = None) -> dict:
     if q:
         like = f"%{q}%"
         where.append(
-            "(api_key_name LIKE ? OR account_name LIKE ? OR model LIKE ? OR finish_reason LIKE ? OR error_msg LIKE ?)"
+            "(api_key_name LIKE ? OR account_name LIKE ? OR model LIKE ? OR resolved_model LIKE ? OR finish_reason LIKE ? OR error_msg LIKE ?)"
         )
-        values.extend([like, like, like, like, like])
+        values.extend([like] * 6)
 
     status = str(filters.get("status") or "all").strip()
     if status == "success":
@@ -1528,7 +1530,7 @@ def get_stats(period: str = "today") -> dict:
     """).fetchall()
 
     recent_logs = conn.execute("""
-        SELECT id, api_key_name, account_name, model, stream, total_tokens, credit,
+        SELECT id, api_key_name, account_name, model, provider, resolved_model, stream, total_tokens, credit,
                finish_reason, duration_ms, status_code, error_msg, created_at
         FROM logs ORDER BY id DESC LIMIT 8
     """).fetchall()

@@ -131,6 +131,7 @@ def test_fingerprint_rewrite_can_be_disabled(monkeypatch):
 
 
 def test_terminal_code_does_not_penalize_or_rotate(monkeypatch):
+    monkeypatch.setattr(auth_manager.db, "list_accounts", lambda **kwargs: [{"id": 7, "status": "active"}])
     monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
     marks = []
     picks = []
@@ -166,6 +167,7 @@ def test_terminal_code_does_not_penalize_or_rotate(monkeypatch):
 
 
 def test_auth_code_expires_and_tries_the_next_account(monkeypatch):
+    monkeypatch.setattr(auth_manager.db, "list_accounts", lambda **kwargs: [{"id": 3, "status": "active"}])
     monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
     marks = []
     seen = []
