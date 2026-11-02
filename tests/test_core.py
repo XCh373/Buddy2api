@@ -2126,11 +2126,11 @@ def _collect_non_stream_upstream(monkeypatch, delta):
         {"id": 1, "name": "test-account"},
         None,
         "test-model",
-        0,
+        time.time() - 0.05,
     ))
 
 
-def test_non_stream_aggregator_rejects_terminal_without_output(monkeypatch):
+def test_non_stream_aggregator_rejects_terminal_without_output(monkeypatch, isolated_db):
     result = _collect_non_stream_upstream(monkeypatch, {})
 
     assert result[0] == "error"
@@ -2139,7 +2139,7 @@ def test_non_stream_aggregator_rejects_terminal_without_output(monkeypatch):
     assert "without content" in result[1][1]["error"]["message"]
 
 
-def test_non_stream_aggregator_accepts_reasoning_only_output(monkeypatch):
+def test_non_stream_aggregator_accepts_reasoning_only_output(monkeypatch, isolated_db):
     result = _collect_non_stream_upstream(
         monkeypatch,
         {"reasoning_content": "internal only"},

@@ -13,6 +13,7 @@ proxy.py — 请求代理转发
 import asyncio
 import json
 import os
+import sys
 import time
 from typing import AsyncGenerator, Optional
 
@@ -734,7 +735,30 @@ def _log_request(api_key_info, account, model_name, stream,
                   prompt_t, completion_t, total_t, credit,
                   finish_reason, status_code, error_msg, t0,
                   increment_usage: bool = True):
-    elapsed_ms = int((time.time() - t0) * 1000)
+    # 防御性校验：t0 应为发起请求时的 time.time()。历史上有测试漏配
+    # isolated_db 且把 t0 传成 0，导致 duration_ms 被算成 ~1.79e12 毫秒
+    # （约 56 年）并污染生产库的 /admin/stats 均值。这里只在 t0 非正数或
+    # 结果越界（负数 / 超过 24 小时）时把 elapsed_ms 归一为 0 并打一行
+    # warn，绝不抛异常，从而不影响请求主流程、也不改变正常请求的行为。
+    try:
+        raw_elapsed_ms = (time.time() - t0) * 1000
+    except (TypeError, ValueError):
+        raw_elapsed_ms = None
+    max_elapsed_ms = 24 * 60 * 60 * 1000  # 24 小时
+    if (
+        not isinstance(t0, (int, float))
+        or t0 <= 0
+        or raw_elapsed_ms is None
+        or raw_elapsed_ms < 0
+        or raw_elapsed_ms > max_elapsed_ms
+    ):
+        sys.stderr.write(
+            f"[warn] _log_request: suspicious duration "
+            f"(t0={t0!r}, elapsed_ms={raw_elapsed_ms!r}); recording 0\n"
+        )
+        elapsed_ms = 0
+    else:
+        elapsed_ms = int(raw_elapsed_ms)
     log_data = {
         "api_key_id": api_key_info.get("id") if api_key_info else None,
         "api_key_name": api_key_info.get("name") if api_key_info else None,
