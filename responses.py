@@ -164,22 +164,19 @@ def _has_image(content) -> bool:
 
 
 def _reject_image_content(content):
-    """Reject only the image shapes Chat tool messages cannot carry.
+    """Reject only images that cannot be represented faithfully.
 
     A user message may carry a structured image: Chat Completions accepts
     ``{"type":"image_url"}`` content parts there, and the bridge forwards them.
-    A tool result may not: the Chat tool message content is text-only, so an
-    image there is refused explicitly instead of being silently flattened.
+    A tool result's images are hoisted into a following user message
+    (``_split_tool_output_images``), so they are accepted too. What is still
+    refused is an image with no usable ``image_url``: it cannot be forwarded or
+    hoisted, and silently dropping it would mislead the model.
     """
     if isinstance(content, list):
         for part in content:
             _reject_image_content(part)
     elif isinstance(content, dict):
-        if ((content.get("type") == "function_call_output" and _has_image(content.get("output")))
-                or (content.get("role") == "tool" and _has_image(content.get("content")))):
-            raise UnsupportedImageInput(
-                "工具结果中的图片暂不支持透传（Chat 工具消息只接受文本）；请求未发送至上游。"
-            )
         if content.get("type") in {"input_image", "image_url"}:
             value = content.get("image_url")
             url = value.get("url") if isinstance(value, dict) else value
@@ -230,6 +227,38 @@ def _chat_content(content):
             if text:
                 parts.append({"type": "text", "text": text})
     return parts
+
+
+# Placeholder left in a Chat ``role:"tool"`` message whose image was hoisted out
+# into a following user message. Upstream rejects an empty tool content, so a
+# text-less tool result that carried images keeps this marker instead.
+_TOOL_IMAGE_PLACEHOLDER = "[image]"
+
+
+def _is_image_part(part) -> bool:
+    return isinstance(part, dict) and part.get("type") in {"input_image", "image_url"}
+
+
+def _split_tool_output_images(output):
+    """Split a Responses ``function_call_output.output`` into (images, text).
+
+    ``output`` is a string, an object, or a list of content parts. Chat's
+    ``role:"tool"`` message can only carry text, so any image parts are pulled
+    out here and returned separately; the caller hoists them into a user
+    message that follows this turn's tool messages. When ``output`` has no
+    image, ``images`` is empty and ``text`` reproduces the old behaviour
+    (a string as-is, an object json-encoded, a list flattened to text).
+    """
+    if not isinstance(output, list):
+        if isinstance(output, dict):
+            return [], json.dumps(output)
+        return [], str(output)
+    if not any(_is_image_part(p) for p in output):
+        return [], _flatten_content(output)
+    images = [p for p in output if _is_image_part(p)]
+    rest = [p for p in output if not _is_image_part(p)]
+    text = _flatten_content(rest) if rest else ""
+    return images, text
 
 
 def dropped_tool_types(resp_payload: dict) -> list[dict]:
@@ -284,6 +313,18 @@ def responses_to_chat(resp_payload: dict) -> dict:
     inp = resp_payload.get("input")
     if isinstance(inp, list):
         pending_tool_calls = []
+        # Images pulled out of tool results, hoisted into a user message that
+        # follows this run of tool messages (Chat's tool content is text-only).
+        pending_hoist_images = []
+
+        def flush_hoisted_images():
+            if pending_hoist_images:
+                messages.append({
+                    "role": "user",
+                    "content": _chat_content(list(pending_hoist_images)),
+                })
+                pending_hoist_images.clear()
+
         for item in inp:
             chat_msg = _input_item_to_chat_message(item)
             if not chat_msg:
@@ -304,6 +345,15 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 })
                 pending_tool_calls = []
 
+            # A tool result that carried images keeps them out of its (text-only)
+            # tool message; collect them to hoist once this tool run ends. Any
+            # non-tool message closes that run, so flush before appending it.
+            hoisted = chat_msg.pop("_hoisted_images", None)
+            if hoisted:
+                pending_hoist_images.extend(hoisted)
+            if chat_msg.get("role") != "tool":
+                flush_hoisted_images()
+
             if chat_msg.get("role") == "developer":
                 chat_msg["role"] = "system"
             messages.append(chat_msg)
@@ -314,6 +364,7 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 "content": None,
                 "tool_calls": pending_tool_calls,
             })
+        flush_hoisted_images()
     elif isinstance(inp, str) and inp.strip():
         messages.append({"role": "user", "content": inp})
 
@@ -416,9 +467,21 @@ def _input_item_to_chat_message(item) -> Optional[dict]:
     elif kind == "function_call_output":
         call_id = item.get("call_id", "")
         output = item.get("output", "")
+        msg = {"role": "tool", "tool_call_id": call_id}
+        images, text_content = _split_tool_output_images(output)
+        if images:
+            # Tool-result images cannot ride a Chat ``role:"tool"`` message (its
+            # content is text). Hoist them: the caller moves them into a user
+            # message right after this turn's tool messages. The tool message
+            # keeps only its text (a placeholder when it had none, so upstream
+            # does not reject an empty tool content).
+            msg["content"] = text_content if text_content else _TOOL_IMAGE_PLACEHOLDER
+            msg["_hoisted_images"] = images
+            return msg
         if isinstance(output, dict):
             output = json.dumps(output)
-        return {"role": "tool", "tool_call_id": call_id, "content": str(output)}
+        msg["content"] = str(output)
+        return msg
 
     elif kind == "function_call":
         # 历史 function_call in input（罕见，保留）

@@ -26,25 +26,44 @@ TOOL_IMAGE_CONTENTS = [
 
 
 @pytest.mark.parametrize("content", TOOL_IMAGE_CONTENTS)
+def test_tool_result_images_hoisted_into_user_message(content):
+    """Tool-result images are hoisted into a following user message, not rejected.
+
+    Chat's ``role:"tool"`` content is text-only, so an image there cannot ride
+    the tool message. ``responses_to_chat`` moves it into a ``user`` message
+    right after the tool turn (see ``_split_tool_output_images``). The tool
+    message keeps a text placeholder and no base64 blob.
+    """
+    converted = responses.responses_to_chat({"input": content})
+    msgs = converted["messages"]
+    tool_idx = next(i for i, m in enumerate(msgs) if m["role"] == "tool")
+    tool_msg = msgs[tool_idx]
+    assert isinstance(tool_msg["content"], str)
+    assert tool_msg["content"] == "[image]"
+    assert "base64" not in tool_msg["content"]
+    follow = msgs[tool_idx + 1]
+    assert follow["role"] == "user"
+    blob = json.dumps(follow["content"], ensure_ascii=False)
+    assert '"type": "image_url"' in blob
+
+
+@pytest.mark.parametrize("content", TOOL_IMAGE_CONTENTS)
 @pytest.mark.parametrize("stream", [False, True])
-def test_tool_result_images_rejected_before_quota_or_provider(monkeypatch, content, stream):
-    """Tool-result images cannot ride a Chat tool message; refuse before dispatch."""
-    calls = []
-    monkeypatch.setattr(server, "_check_client_auth", lambda *a, **k: {"id": 1})
-    def forbidden(*a, **k):
-        calls.append(True)
-        raise AssertionError("Rejected images must fail before dispatch/quota")
-    monkeypatch.setattr(server, "_reserve_client_quota", forbidden)
-    monkeypatch.setattr(router, "bind_http", forbidden)
-    monkeypatch.setattr(router, "ensure_usable", forbidden)
-    monkeypatch.setattr(router, "responses_after_bind", forbidden)
-    async def run():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://synthetic") as client:
-            return await client.post("/v1/responses", json={"model": "auto", "input": content, "stream": stream})
-    result = asyncio.run(run())
-    assert result.status_code == 400
-    assert result.json()["error"]["code"] == "unsupported_image_input"
-    assert not calls
+def test_tool_result_images_reach_provider(content, stream):
+    """A tool-result image no longer short-circuits with a 400; it is dispatched."""
+    seen = {}
+
+    async def handler(chat_payload, *a, **k):
+        seen["messages"] = chat_payload["messages"]
+        return ("error", (599, {"error": {"message": "captured"}}))
+
+    result = asyncio.run(responses.proxy_responses({"model": "auto", "input": content, "stream": stream},
+                                                   chat_handler=handler))
+    # Reached the handler (no pre-dispatch rejection) with hoisted structure.
+    assert "messages" in seen
+    roles = [m["role"] for m in seen["messages"]]
+    assert "tool" in roles and "user" in roles
+    assert result[0] == "error"  # handler's sentinel, not a 400 image rejection
 
 
 @pytest.mark.parametrize("content", USER_IMAGE_CONTENTS)
@@ -66,13 +85,69 @@ def test_image_guard_does_not_parse_text_literals():
     assert converted["messages"][1]["content"] == text
 
 
-def test_direct_bridge_tool_image_rejection_never_calls_handler():
-    async def forbidden(*a):
-        raise AssertionError("Provider must not run")
+def test_parallel_tool_images_hoisted_after_tool_run():
+    """Images from a batch of parallel tool results hoist into one user message
+    that lands *after* the whole tool run (Chat needs consecutive tool msgs)."""
+    img2 = {"type": "input_image", "image_url": "data:image/png;base64,BBB"}
+    body = {"model": "auto", "input": [
+        {"role": "user", "content": "do two things"},
+        {"type": "function_call", "name": "a", "call_id": "c1", "arguments": "{}"},
+        {"type": "function_call", "name": "b", "call_id": "c2", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": [IMAGE, {"type": "input_text", "text": "r1"}]},
+        {"type": "function_call_output", "call_id": "c2", "output": [{"type": "input_text", "text": "r2"}, img2]},
+        {"role": "user", "content": "thanks"},
+    ]}
+    msgs = responses.responses_to_chat(body)["messages"]
+    roles = [m["role"] for m in msgs]
+    # assistant(tool_calls) -> tool c1 -> tool c2 -> user(images) -> user
+    assert roles == ["user", "assistant", "tool", "tool", "user", "user"]
+    assert [m["tool_call_id"] for m in msgs if m["role"] == "tool"] == ["c1", "c2"]
+    imgs = msgs[4]["content"]
+    assert [p["type"] for p in imgs] == ["image_url", "image_url"]
+    assert imgs[0]["image_url"]["url"] == IMAGE["image_url"]
+    assert imgs[1]["image_url"]["url"] == img2["image_url"]
+    # Tool messages kept their own text, no base64 repr.
+    assert msgs[2]["content"] == "r1" and msgs[3]["content"] == "r2"
+
+
+def test_tool_placeholder_when_image_only():
+    """A tool result that is only an image keeps a text placeholder."""
+    IMAGE2 = {"type": "input_image", "image_url": "data:image/png;base64,CCC"}
+    body = {"input": [{"type": "function_call_output", "call_id": "c", "output": [IMAGE2]}]}
+    msgs = responses.responses_to_chat(body)["messages"]
+    assert msgs[0]["role"] == "tool" and msgs[0]["content"] == "[image]"
+    assert msgs[1]["role"] == "user"
+    assert msgs[1]["content"][0]["type"] == "image_url"
+
+
+def test_plain_text_tool_result_unchanged():
+    """A tool result with no image keeps the old string content and adds no user."""
+    body = {"input": [
+        {"type": "function_call", "name": "echo", "call_id": "c", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c", "output": "hello"},
+    ]}
+    msgs = responses.responses_to_chat(body)["messages"]
+    assert msgs[1]["role"] == "tool" and msgs[1]["content"] == "hello"
+    assert all(m["role"] != "user" or m.get("role") == "user" for m in msgs)
+    assert len(msgs) == 2  # assistant(tool_calls) + tool; no spurious user
+
+
+def test_direct_bridge_tool_image_reaches_handler_hoisted():
+    """The bridge calls the provider with the tool image hoisted into a user msg."""
+    captured = {}
+
+    async def handler(chat_payload, *a):
+        captured["messages"] = chat_payload["messages"]
+        return ("error", (599, {"error": {"message": "captured"}}))
+
     body = {"input": [{"type": "function_call_output", "call_id": "c", "output": [IMAGE]}]}
-    result = asyncio.run(responses.proxy_responses(body, chat_handler=forbidden))
-    assert result[0] == "error" and result[1][0] == 400
-    assert result[1][1]["error"]["code"] == "unsupported_image_input"
+    result = asyncio.run(responses.proxy_responses(body, chat_handler=handler))
+    assert "messages" in captured
+    msgs = captured["messages"]
+    assert msgs[0]["role"] == "tool" and msgs[0]["content"] == "[image]"
+    assert msgs[1]["role"] == "user"
+    assert '"type": "image_url"' in json.dumps(msgs[1]["content"], ensure_ascii=False)
+    assert result[0] == "error" and result[1][0] == 599  # handler ran, no 400 gate
 
 
 def _sse(value):
