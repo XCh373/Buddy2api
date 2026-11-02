@@ -725,6 +725,17 @@ def save_account_cooldown(account_id: int, fail_count: int, cooldown_until: floa
         conn.close()
 
 
+def delete_account_cooldown(account_id: int) -> None:
+    """Drop the row entirely on success -- a zeroed row is just clutter."""
+    conn = get_conn()
+    try:
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute("DELETE FROM account_cooldown WHERE account_id=?", (int(account_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def list_account_cooldowns() -> list[dict]:
     with connection() as conn:
         rows = conn.execute(

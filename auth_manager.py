@@ -199,7 +199,7 @@ def mark_account_success(aid: int):
     with _failure_lock:
         _account_failures.pop(aid, None)
         _failure_counts.pop(aid, None)
-    _persist_cooldown(aid, 0, 0.0, 0)
+    _forget_cooldown(aid)
     clear_auth_confirmations(aid)
 
 
@@ -296,6 +296,14 @@ def _persist_cooldown(aid: int, count: int, until_epoch: float, status_code: int
     try:
         db.save_account_cooldown(int(aid), int(count), float(until_epoch), int(status_code))
     except Exception:  # noqa: BLE001 - persistence must never break dispatch
+        pass
+
+
+def _forget_cooldown(aid: int) -> None:
+    """Remove the persisted row on success. Best-effort, never blocking."""
+    try:
+        db.delete_account_cooldown(int(aid))
+    except Exception:  # noqa: BLE001
         pass
 
 

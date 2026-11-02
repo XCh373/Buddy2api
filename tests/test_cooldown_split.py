@@ -129,3 +129,11 @@ def test_persisted_and_reloaded(isolated_db):
     loaded = auth_manager.load_cooldowns_from_db()
     assert loaded >= 1
     assert auth_manager.cooldown_remaining(aid) > 800
+
+def test_success_removes_persisted_row(isolated_db):
+    """成功后应删除持久化行，而不是留一条 cooldown_until=0 的脏行。"""
+    aid = _add()
+    auth_manager.mark_account_failure(aid, 429)
+    assert any(r["account_id"] == aid for r in db.list_account_cooldowns())
+    auth_manager.mark_account_success(aid)
+    assert not any(r["account_id"] == aid for r in db.list_account_cooldowns())
