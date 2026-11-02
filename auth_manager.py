@@ -49,8 +49,19 @@ _token_locks_guard = threading.Lock()
 _route_lock = threading.Lock()
 _sticky_account_id: dict[str, int] = {}
 _failure_lock = threading.Lock()
-_account_failures: dict[int, tuple[int, float]] = {}
+# Cooldown deadline per account (monotonic seconds). Only says "when may this
+# account be used again" -- never carries the failure streak.
+_account_failures: dict[int, float] = {}
+# Consecutive-failure streak per account: (count, streak_expires_at_monotonic).
+# Kept in its OWN store so that an expiring cooldown can never erase it. This is
+# what makes the 30 -> 60 -> 120 -> 240 -> 300s ladder actually escalate instead
+# of being pinned at 30s forever.
+_failure_counts: dict[int, tuple[int, float]] = {}
 _resource_locks = weakref.WeakKeyDictionary()
+
+# Cooldown tuning (see docs/investigation/09 & 10).
+FAILURE_COUNT_TTL_SECONDS = 6 * 3600     # streak survives this long without success
+MAX_COOLDOWN_SECONDS = 21 * 3600         # longest real reset window observed: 20.4h
 
 
 def _get_token_lock(aid: int) -> asyncio.Lock:
@@ -175,12 +186,37 @@ def _note_structural_auth(aid: int) -> int:
 
 
 def mark_account_success(aid: int):
+    """A real success is the ONLY place the failure streak resets.
+
+    The streak (``_failure_counts``) and the cooldown deadline
+    (``_account_failures``) are stored separately on purpose. Sharing one record
+    and letting the cooldown expiry remove it is what used to pin every retry at
+    30s: the counter was wiped the moment the cooldown lapsed, so the exponential
+    step never advanced. The same pattern is already used by
+    ``_auth_confirmations`` above ("an earlier version shared one record and lost
+    the tally").
+    """
     with _failure_lock:
         _account_failures.pop(aid, None)
+        _failure_counts.pop(aid, None)
+    _persist_cooldown(aid, 0, 0.0, 0)
     clear_auth_confirmations(aid)
 
 
-def mark_account_failure(aid: int, status_code: int = 0, *, structural_auth: bool = False):
+def _failure_streak(aid: int, now: float) -> int:
+    """Current consecutive-failure count, dropping it once its TTL has passed."""
+    entry = _failure_counts.get(aid)
+    if not entry:
+        return 0
+    count, expires_at = entry
+    if expires_at and expires_at <= now:
+        _failure_counts.pop(aid, None)
+        return 0
+    return count
+
+
+def mark_account_failure(aid: int, status_code: int = 0, *, structural_auth: bool = False,
+                         reset_at: Optional[float] = None):
     """Record one failed attempt.
 
     Cooldown bookkeeping is recorded for every failure. ``status='expired'`` is
@@ -188,14 +224,30 @@ def mark_account_failure(aid: int, status_code: int = 0, *, structural_auth: boo
     failure, never a bare edge 401 or a rate-limit code) AND the consecutive
     structural-auth tally reaches ``EXPIRE_CONFIRMATIONS`` AND the account is
     currently ``active`` (an operator-set ``inactive`` is never overwritten).
+
+    ``reset_at`` (epoch seconds) is the upstream-declared reset time when the
+    error body carried one (6004 carries an absolute timestamp hours out). When
+    present the cooldown is pinned to it instead of the short backoff step, so a
+    drained account stays out of the pool until it can actually serve again.
     """
+    now = time.monotonic()
     with _account_state_lock(aid):
         with _failure_lock:
-            count, _ = _account_failures.get(aid, (0, 0.0))
-            count += 1
+            count = _failure_streak(aid, now) + 1
+            _failure_counts[aid] = (count, now + FAILURE_COUNT_TTL_SECONDS)
             base = 30 if status_code in {401, 403, 429} else 5
-            cooldown = min(300, base * (2 ** min(count - 1, 4)))
-            _account_failures[aid] = (count, time.monotonic() + cooldown)
+            step = min(300, base * (2 ** min(count - 1, 4)))
+            cooldown = step
+            if reset_at is not None:
+                remaining = reset_at - time.time()
+                # Pin to the upstream reset point, but never exceed the horizon so
+                # a garbled timestamp cannot lock an account out indefinitely.
+                if 0 < remaining <= MAX_COOLDOWN_SECONDS:
+                    cooldown = max(cooldown, remaining)
+            deadline = now + cooldown
+            _account_failures[aid] = deadline
+
+        _persist_cooldown(aid, count, time.time() + cooldown, status_code)
 
         if status_code not in {401, 403}:
             return
@@ -211,14 +263,70 @@ def mark_account_failure(aid: int, status_code: int = 0, *, structural_auth: boo
 
 
 def account_is_cooling_down(aid: int) -> bool:
+    """Pure read: never pops, never touches the failure streak."""
     with _failure_lock:
-        failure = _account_failures.get(aid)
-        if not failure:
+        deadline = _account_failures.get(aid)
+        if not deadline:
             return False
-        if failure[1] <= time.monotonic():
-            _account_failures.pop(aid, None)
-            return False
-        return True
+        return deadline > time.monotonic()
+
+
+def cooldown_remaining(aid: int) -> float:
+    """Seconds until this account may be used again (0 when not cooling)."""
+    with _failure_lock:
+        deadline = _account_failures.get(aid)
+        if not deadline:
+            return 0.0
+        remaining = deadline - time.monotonic()
+        return remaining if remaining > 0 else 0.0
+
+
+def earliest_cooldown_remaining(account_ids) -> float:
+    """Smallest non-zero cooldown across the given accounts (0 if none cooling)."""
+    best = None
+    for aid in account_ids:
+        remaining = cooldown_remaining(aid)
+        if remaining > 0 and (best is None or remaining < best):
+            best = remaining
+    return best or 0.0
+
+
+def _persist_cooldown(aid: int, count: int, until_epoch: float, status_code: int) -> None:
+    """Write-through to SQLite so cooldowns survive a restart. Best-effort."""
+    try:
+        db.save_account_cooldown(int(aid), int(count), float(until_epoch), int(status_code))
+    except Exception:  # noqa: BLE001 - persistence must never break dispatch
+        pass
+
+
+def load_cooldowns_from_db() -> int:
+    """Restore cooldown deadlines after a restart. Returns how many were loaded."""
+    try:
+        rows = db.list_account_cooldowns()
+    except Exception:  # noqa: BLE001
+        return 0
+    now_mono = time.monotonic()
+    now_epoch = time.time()
+    loaded = 0
+    with _failure_lock:
+        for row in rows:
+            aid = int(row.get("account_id") or 0)
+            until_epoch = float(row.get("cooldown_until") or 0.0)
+            count = int(row.get("fail_count") or 0)
+            if count > 0:
+                _failure_counts[aid] = (count, now_mono + FAILURE_COUNT_TTL_SECONDS)
+            remaining = until_epoch - now_epoch
+            if aid and remaining > 0:
+                _account_failures[aid] = now_mono + remaining
+                loaded += 1
+    return loaded
+
+
+def reset_cooldown_state() -> None:
+    """Test helper: drop all in-memory cooldown bookkeeping."""
+    with _failure_lock:
+        _account_failures.clear()
+        _failure_counts.clear()
 
 
 # ============================================================

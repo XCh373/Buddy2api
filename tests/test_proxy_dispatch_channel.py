@@ -14,7 +14,9 @@ import proxy
 def _run_non_stream(monkeypatch, provider):
     seen = {}
 
-    async def fake_retry(body, api_key_info, model_name, provider="workbuddy"):
+    async def fake_retry(body, api_key_info, model_name, provider="workbuddy", request_id=""):
+        # request_id is an optional correlation param added for BUD-012; the
+        # double must accept it so dispatch wiring stays testable.
         seen["provider"] = provider
         return ("json", {"choices": [{"message": {"content": "ok"}}]})
 

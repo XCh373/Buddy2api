@@ -203,12 +203,13 @@ def test_auth_code_expires_and_tries_the_next_account(monkeypatch):
 
 
 def test_rate_limit_wording_does_not_expire_the_account():
-    action, status, _detail, _failure = workbuddy_outbound.account_rule(
+    action, status, _detail, _failure, reset_at = workbuddy_outbound.account_rule(
         200,
         {"code": 11140, "msg": "The model provider is rate-limiting requests."},
     )
     assert action == "rotate"
     assert status == 200
+    assert reset_at is None  # 11140 不带明确重置时间
     illegal = workbuddy_outbound.account_rule(
         403,
         {"error": {"data": {"code": 11140, "msg": "request illegal"}}},

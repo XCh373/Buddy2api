@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from typing import AsyncGenerator, Optional
 
 import httpx
@@ -82,17 +83,20 @@ def _apply_account_rule(account_id: int, status: int, detail):
     :func:`workbuddy_outbound.is_auth_failure` verdict may count toward actually
     marking the account expired; a non-auth "expire" still rotates to the next
     account via its cooldown, but cannot write ``status='expired'``.
+    Returns ``(action, client_status, client_detail, failure, reset_at)``. The
+    ``reset_at`` (epoch seconds) pins the cooldown to the upstream reset point
+    when the error body carried one; ``None`` falls back to exponential backoff.
     """
     ruled = workbuddy_outbound.account_rule(status, detail)
     if ruled is None:
         return None
-    action, client_status, client_detail, failure = ruled
+    action, client_status, client_detail, failure, reset_at = ruled
     if action == "expire":
         structural = workbuddy_outbound.is_auth_failure(status, detail)
         auth_manager.mark_account_failure(account_id, 401, structural_auth=structural)
     elif action == "rotate":
-        auth_manager.mark_account_failure(account_id, 429)
-    return action, client_status, client_detail, failure
+        auth_manager.mark_account_failure(account_id, 429, reset_at=reset_at)
+    return action, client_status, client_detail, failure, reset_at
 
 
 def _format_httpx_error(exc: BaseException) -> str:
@@ -734,7 +738,9 @@ class _SSEEventDecoder:
 def _log_request(api_key_info, account, model_name, stream,
                   prompt_t, completion_t, total_t, credit,
                   finish_reason, status_code, error_msg, t0,
-                  increment_usage: bool = True):
+                  increment_usage: bool = True,
+                  cached_tokens=None, cache_write_tokens=None,
+                  request_id=None, attempt=None, failure_class=None):
     # 防御性校验：t0 应为发起请求时的 time.time()。历史上有测试漏配
     # isolated_db 且把 t0 传成 0，导致 duration_ms 被算成 ~1.79e12 毫秒
     # （约 56 年）并污染生产库的 /admin/stats 均值。这里只在 t0 非正数或
@@ -779,6 +785,11 @@ def _log_request(api_key_info, account, model_name, stream,
         "status_code": status_code,
         "error_msg": error_msg,
         "increment_usage": increment_usage,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "request_id": request_id,
+        "attempt": attempt,
+        "failure_class": failure_class,
     }
     try:
         db.record_request(log_data)
@@ -789,6 +800,69 @@ def _log_request(api_key_info, account, model_name, stream,
 def _request_identity(info, provider):
     value = info.get("_session_affinity") if isinstance(info, dict) else None
     return value if isinstance(value, session_identity.Identity) and value.channel == provider else None
+
+
+def _new_request_id() -> str:
+    """Short opaque id used to correlate every attempt of one user request."""
+    return uuid.uuid4().hex[:16]
+
+
+def _cache_usage(usage) -> dict:
+    """Pull cache telemetry out of a usage blob, leaving absent fields as None.
+
+    BUD-010: a missing ``cached_tokens`` must stay None (upstream said nothing),
+    never 0 (a real cache miss), or the cache-hit rate cannot be measured.
+    """
+    if not isinstance(usage, dict):
+        return {"cached_tokens": None, "cache_write_tokens": None}
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    if not isinstance(details, dict):
+        details = {}
+
+    def _as_int(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "cached_tokens": _as_int(details.get("cached_tokens")),
+        "cache_write_tokens": _as_int(details.get("cache_write_tokens")),
+    }
+
+
+def _no_account_left(tried_ids):
+    """Build the response when the pool is fully drained or cooling.
+
+    Returns ``((status, body), retry_after_seconds_or_None)``.
+
+    Before this existed the loop just ``break``-ed and the client got a bare
+    "No available accounts" with no hint of when to retry. When every candidate
+    is merely cooling down (not broken), we can tell the caller exactly how long
+    to wait -- the earliest cooldown deadline -- which is far better than letting
+    the client hammer us or give up blind.
+    """
+    remaining = auth_manager.earliest_cooldown_remaining(tried_ids or [])
+    if remaining > 0:
+        seconds = int(remaining + 0.999)
+        body = {
+            "error": {
+                "message": (
+                    f"所有可用账号都已在限流冷却中，请约 {seconds} 秒后重试"
+                    f"（上游用量配额恢复中）。"
+                ),
+                "type": "rate_limit_error",
+                "code": "all_accounts_cooling",
+                "retry_after": seconds,
+            }
+        }
+        return (503, body), seconds
+    return (
+        (503, {"error": {"message": "No available accounts", "type": "server_error"}}),
+        None,
+    )
 
 
 async def _pick_for_request(tried, info, provider):
@@ -831,6 +905,7 @@ async def _json_chat_with_retries(
     api_key_info: Optional[dict],
     model_name: str,
     provider: str = "workbuddy",
+    request_id: str = "",
 ) -> tuple:
     tried_ids: set[int] = set()
     max_retries = auth_manager.account_attempt_limit(provider)
@@ -865,7 +940,7 @@ async def _json_chat_with_retries(
         detail = result[1][1]
         ruled = _apply_account_rule(account["id"], err_status, detail)
         if ruled is not None:
-            action, client_status, client_detail, failure = ruled
+            action, client_status, client_detail, failure, _reset_at = ruled
             last_error = ("error", (client_status, client_detail))
             error_message = client_detail
             if isinstance(client_detail, dict):
@@ -877,6 +952,7 @@ async def _json_chat_with_retries(
                 0, 0, 0, 0, "retry" if will_retry else failure,
                 client_status, _failure_log_message(failure, str(error_message)), t0,
                 increment_usage=not will_retry,
+                request_id=request_id, attempt=attempt, failure_class=failure,
             )
             if not will_retry:
                 return last_error
@@ -896,6 +972,7 @@ async def _json_chat_with_retries(
             0, 0, 0, 0, "retry" if will_retry else failure,
             err_status, _failure_log_message(failure, str(error_message)), t0,
             increment_usage=not will_retry,
+            request_id=request_id, attempt=attempt, failure_class=failure,
         )
         if not will_retry:
             return result
@@ -903,7 +980,7 @@ async def _json_chat_with_retries(
 
     return last_error or (
         "error",
-        (503, {"error": {"message": "No available accounts", "type": "server_error"}}),
+        _no_account_left(tried_ids)[0],
     )
 
 
@@ -926,6 +1003,7 @@ async def proxy_chat_completions(
     if log_model is None and isinstance(api_key_info, dict):
         log_model = api_key_info.get("_log_model")
     model_name = log_model if log_model is not None else payload.get("model", "auto")
+    request_id = _new_request_id()
 
     identity = _request_identity(api_key_info, provider)
     lease = None
@@ -939,19 +1017,20 @@ async def proxy_chat_completions(
             if client_wants_stream:
                 first = await _pick_for_request(set(), api_key_info, provider)
                 if first is None:
-                    return ("error", (503, {"error": {"message": "No available accounts", "type": "server_error"}}))
-                stream = _leased_stream(_stream_upstream(body, api_key_info, model_name, provider, first_account=first), lease)
+                    pool = [a["id"] for a in db.get_active_accounts(provider)]
+                    return ("error", _no_account_left(pool)[0])
+                stream = _leased_stream(_stream_upstream(body, api_key_info, model_name, provider, first_account=first, request_id=request_id), lease)
                 lease = None  # ownership transferred to the stream
                 return ("stream", stream)
-            return await _json_chat_with_retries(body, api_key_info, model_name, provider)
+            return await _json_chat_with_retries(body, api_key_info, model_name, provider, request_id=request_id)
         except session_identity.StateUnavailable:
             return session_identity.state_error()
         finally:
             if lease is not None:
                 await run_in_threadpool(lease.close)
     if client_wants_stream:
-        return ("stream", _stream_upstream(body, api_key_info, model_name, provider))
-    return await _json_chat_with_retries(body, api_key_info, model_name, provider)
+        return ("stream", _stream_upstream(body, api_key_info, model_name, provider, request_id=request_id))
+    return await _json_chat_with_retries(body, api_key_info, model_name, provider, request_id=request_id)
 
 
 async def test_account_chat(account: dict, model: str = "auto", prompt: str = "ping") -> dict:
@@ -1006,7 +1085,7 @@ async def _stream_upstream(
     api_key_info: Optional[dict],
     model_name: str,
     provider: str = "workbuddy",
-    *, first_account=None,
+    *, first_account=None, request_id: str = "",
 ) -> AsyncGenerator[bytes, None]:
     """Stream upstream SSE with pre-output account failover and backoff."""
     tried_ids: set[int] = set()
@@ -1019,6 +1098,7 @@ async def _stream_upstream(
     pending_retry_log: dict | None = None
 
     max_attempts = auth_manager.account_attempt_limit(provider)
+    pool_exhausted = False
     for attempt in range(max_attempts):
         try:
             account = (await _recheck_first(first_account, api_key_info, provider)
@@ -1029,6 +1109,7 @@ async def _stream_upstream(
             yield b"data: [DONE]\n\n"
             return
         if not account:
+            pool_exhausted = True
             break
         if pending_retry_log is not None:
             _log_request(
@@ -1045,6 +1126,8 @@ async def _stream_upstream(
                 pending_retry_log["message"],
                 pending_retry_log["started"],
                 increment_usage=False,
+                request_id=request_id, attempt=pending_retry_log.get("attempt"),
+                failure_class=pending_retry_log.get("failure"),
             )
             await _retry_delay(pending_retry_log["attempt"])
             pending_retry_log = None
@@ -1084,7 +1167,7 @@ async def _stream_upstream(
                         parsed = _safe_err(raw_error, response.status_code)
                         ruled = _apply_account_rule(account["id"], response.status_code, parsed)
                         if ruled is not None:
-                            action, client_status, client_detail, ruled_failure = ruled
+                            action, client_status, client_detail, ruled_failure, _reset_at = ruled
                             message = http_msg
                             if isinstance(client_detail, dict):
                                 error_data = client_detail.get("error") if isinstance(client_detail.get("error"), dict) else client_detail
@@ -1099,6 +1182,7 @@ async def _stream_upstream(
                                     api_key_info, account, model_name, True,
                                     0, 0, 0, 0, ruled_failure, client_status,
                                     _failure_log_message(ruled_failure, message), t0,
+                                    request_id=request_id, attempt=attempt, failure_class=ruled_failure,
                                 )
                                 if last_error_event is not None:
                                     yield _json_sse_event(last_error_event)
@@ -1144,6 +1228,7 @@ async def _stream_upstream(
                             api_key_info, account, model_name, True,
                             0, 0, 0, 0, failure, response.status_code,
                             _failure_log_message(failure, http_msg), t0,
+                            request_id=request_id, attempt=attempt, failure_class=failure,
                         )
                         yield _err_sse_event(last_error, response.status_code, failure)
                         return
@@ -1203,6 +1288,7 @@ async def _stream_upstream(
             _log_request(
                 api_key_info, account, model_name, True,
                 0, 0, 0, 0, failure, 502, _failure_log_message(failure, http_msg), t0,
+                request_id=request_id, attempt=attempt, failure_class=failure,
             )
             yield _err_sse_event(last_error, 502, failure)
             return
@@ -1258,6 +1344,7 @@ async def _stream_upstream(
                 observer.usage.get("total_tokens", 0),
                 observer.usage.get("credit", 0),
                 failure, 502, _failure_log_message(failure, eof_error), t0,
+                request_id=request_id, attempt=attempt, failure_class=failure,
             )
             if observer.upstream_error_event is not None:
                 yield _json_sse_event(observer.upstream_error_event)
@@ -1291,6 +1378,8 @@ async def _stream_upstream(
             observer.usage.get("total_tokens", 0),
             observer.usage.get("credit", 0),
             log_finish, 200, log_error, t0,
+            request_id=request_id, failure_class=None,
+            **_cache_usage(observer.usage),
         )
         for event in pending_terminal_events:
             yield event
@@ -1320,9 +1409,18 @@ async def _stream_upstream(
         failure, final_failure["status"],
         _failure_log_message(failure, final_failure["message"]),
         final_failure["started"],
+        request_id=request_id, attempt=final_failure.get("attempt"), failure_class=failure,
     )
     if last_error_event is not None:
         yield _json_sse_event(last_error_event)
+        yield b"data: [DONE]\n\n"
+    elif pool_exhausted and last_status == 503 and not tried_ids:
+        # Every candidate was merely cooling (nothing was even attempted): tell
+        # the client when to come back instead of a bare server_error.
+        body, _retry_after = _no_account_left([])
+        yield _err_sse_event(
+            json.dumps(body, ensure_ascii=False).encode("utf-8"), 503, "all_accounts_cooling"
+        )
         yield b"data: [DONE]\n\n"
     else:
         yield _err_sse_event(last_error, last_status, failure if failure in FAILURE_CLASSES else None)
@@ -1459,5 +1557,6 @@ async def _collect_stream(
         u.get("total_tokens", 0),
         u.get("credit", 0),
         finish_reason or "stop", 200, "", t0,
+        **_cache_usage(u),
     )
     return ("json", result)

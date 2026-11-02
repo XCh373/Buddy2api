@@ -406,6 +406,7 @@ def init_db():
         _migrate_api_keys(conn)
         _migrate_workbuddy_regions(conn)
         _migrate_logs_provider(conn)
+        _migrate_account_cooldown(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS api_key_daily_usage (
                 api_key_id    INTEGER NOT NULL,
@@ -662,7 +663,74 @@ def _migrate_logs_provider(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE logs ADD COLUMN provider TEXT")
     if "resolved_model" not in cols:
         conn.execute("ALTER TABLE logs ADD COLUMN resolved_model TEXT DEFAULT ''")
+    # BUD-010: cache telemetry. NULL means "upstream did not report it", which is
+    # deliberately distinct from 0 ("upstream reported a real cache miss").
+    if "cached_tokens" not in cols:
+        conn.execute("ALTER TABLE logs ADD COLUMN cached_tokens INTEGER")
+    if "cache_write_tokens" not in cols:
+        conn.execute("ALTER TABLE logs ADD COLUMN cache_write_tokens INTEGER")
+    # BUD-012: correlate every attempt of one user request, including retries and
+    # account rotations, so a 429 chain can be read back as a single story.
+    if "request_id" not in cols:
+        conn.execute("ALTER TABLE logs ADD COLUMN request_id TEXT")
+    if "attempt" not in cols:
+        conn.execute("ALTER TABLE logs ADD COLUMN attempt INTEGER")
+    if "failure_class" not in cols:
+        conn.execute("ALTER TABLE logs ADD COLUMN failure_class TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_request ON logs(request_id)")
+
+
+def _migrate_account_cooldown(conn: sqlite3.Connection):
+    """Cooldown state that must survive a restart.
+
+    Deliberately a plain table with NO expiry semantics: SQLite has no TTL, which
+    is exactly what we want here. A row that "ages out" would take the failure
+    streak with it and drop the backoff ladder back to its first step -- the bug
+    this whole change exists to remove.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_cooldown (
+            account_id     INTEGER PRIMARY KEY,
+            fail_count     INTEGER NOT NULL DEFAULT 0,
+            cooldown_until REAL    NOT NULL DEFAULT 0,
+            last_status    INTEGER NOT NULL DEFAULT 0,
+            updated_at     REAL
+        )
+        """
+    )
+
+
+def save_account_cooldown(account_id: int, fail_count: int, cooldown_until: float,
+                          last_status: int) -> None:
+    conn = get_conn()
+    try:
+        # Cooldown persistence is auxiliary telemetry. It must never take the
+        # global write lock or wait out a busy timeout: a caller that already
+        # holds a write lock would otherwise block the whole request path (this
+        # is exactly the "storage unavailable" condition the gateway is meant to
+        # surface, not to swallow). Better to drop one cooldown row than to hang.
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute(
+            "INSERT INTO account_cooldown (account_id, fail_count, cooldown_until, last_status, updated_at) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(account_id) DO UPDATE SET "
+            "  fail_count=excluded.fail_count, cooldown_until=excluded.cooldown_until, "
+            "  last_status=excluded.last_status, updated_at=excluded.updated_at",
+            (int(account_id), int(fail_count), float(cooldown_until), int(last_status), time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_account_cooldowns() -> list[dict]:
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT account_id, fail_count, cooldown_until, last_status, updated_at FROM account_cooldown"
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _migrate_account_credentials(conn: sqlite3.Connection):
@@ -1225,8 +1293,9 @@ def record_request(data: dict):
                 INSERT INTO logs
                     (api_key_id, api_key_name, account_id, account_name, model, stream,
                      prompt_tokens, completion_tokens, total_tokens, credit,
-                     finish_reason, duration_ms, status_code, error_msg, provider, resolved_model, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     finish_reason, duration_ms, status_code, error_msg, provider, resolved_model,
+                     cached_tokens, cache_write_tokens, request_id, attempt, failure_class, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     data.get("api_key_id"), data.get("api_key_name"),
@@ -1236,7 +1305,10 @@ def record_request(data: dict):
                     data.get("total_tokens", 0), data.get("credit", 0),
                     data.get("finish_reason", ""), data.get("duration_ms", 0),
                     data.get("status_code", 200), data.get("error_msg", ""),
-                    data.get("provider") or "workbuddy", data.get("resolved_model", ""), now,
+                    data.get("provider") or "workbuddy", data.get("resolved_model", ""),
+                    data.get("cached_tokens"), data.get("cache_write_tokens"),
+                    data.get("request_id"), data.get("attempt"), data.get("failure_class"),
+                    now,
                 ),
             )
             if data.get("account_id") and data.get("increment_usage", True):

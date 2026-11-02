@@ -14,7 +14,10 @@ _OFF = {"0", "off", "false", "none", "no"}
 
 _AUTH_CODES = {12153, 14015, 11142}
 _TERMINAL_CODES = {11115, 11128, 11101, 11148, 11155}
-_ROTATE_CODES = {6000, 6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 14003, 14017}
+_ROTATE_CODES = {6000, 6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 14017}
+# 14003 = 模型级饱和（账号本身健康，只是该模型热）。冷却短、优先换模型，
+# 不能当成账号级限流处理，否则会把"某个模型忙"记成"整个账号坏了"。
+_MODEL_SATURATED_CODES = {14003}
 
 _TERMINAL_CLIENT = {
     11115: ("context_length_exceeded", "请求上下文超过上游限制（11115）。换账号没有用。"),
@@ -90,12 +93,16 @@ def prepare(body: dict) -> dict:
     return body
 
 
-def account_rule(status: int, detail) -> tuple[str, int, dict, str] | None:
+def account_rule(status: int, detail) -> tuple[str, int, dict, str, float | None] | None:
     """Return stop, expire, or rotate when a Tencent envelope code decides it.
 
     stop: return this error, leave the account usable.
     expire: session is dead, mark the account expired and try another.
     rotate: this account cannot serve the request, try another without expiring it.
+
+    The fifth element is ``reset_at`` (epoch seconds) when the upstream told us
+    exactly when the block lifts, else ``None``. Callers pin the cooldown to it
+    instead of a fixed 30s -- see ``reset_hint`` and BUD-005.
     """
     code, text = _primary_code(detail)
     if code is None:
@@ -103,12 +110,12 @@ def account_rule(status: int, detail) -> tuple[str, int, dict, str] | None:
     if code == 11140:
         lowered = text.lower()
         if "request illegal" in lowered and "rate" not in lowered:
-            return ("expire", status or 401, _detail_of(detail), "upstream_auth")
+            return ("expire", status or 401, _detail_of(detail), "upstream_auth", None)
         if "rate" in lowered:
-            return ("rotate", status or 429, _detail_of(detail), "upstream_http")
+            return ("rotate", status or 429, _detail_of(detail), "upstream_http", _reset_of(detail))
         return None
     if code in _AUTH_CODES or "offline user session" in text.lower():
-        return ("expire", status or 401, _detail_of(detail), "upstream_auth")
+        return ("expire", status or 401, _detail_of(detail), "upstream_auth", None)
     if code in _TERMINAL_CODES:
         client_code, message = _TERMINAL_CLIENT[code]
         payload = {
@@ -119,10 +126,35 @@ def account_rule(status: int, detail) -> tuple[str, int, dict, str] | None:
                 "code": client_code,
             },
         }
-        return ("stop", 400, payload, client_code)
+        return ("stop", 400, payload, client_code, None)
+    if code in _MODEL_SATURATED_CODES:
+        # Model-level saturation: brief cooldown, prefer another model next time.
+        return ("rotate", status or 429, _detail_of(detail), "upstream_saturated", _reset_of(detail))
     if code in _ROTATE_CODES:
-        return ("rotate", status or 429, _detail_of(detail), "upstream_http")
+        return ("rotate", status or 429, _detail_of(detail), "upstream_http", _reset_of(detail))
     return None
+
+
+def _reset_of(detail) -> float | None:
+    """Best-effort absolute reset time from an error envelope. Never raises."""
+    try:
+        import reset_hint
+
+        return reset_hint.parse_reset_at(_detail_text(detail))[0]
+    except Exception:  # noqa: BLE001 - a parse miss must never break dispatch
+        return None
+
+
+def _detail_text(detail) -> str:
+    """Serialize an error envelope to text for the reset-time parser."""
+    if isinstance(detail, str):
+        return detail
+    try:
+        import json
+
+        return json.dumps(detail, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(detail or "")
 
 
 def _primary_code(detail) -> tuple[int | None, str]:

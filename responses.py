@@ -232,6 +232,24 @@ def _chat_content(content):
     return parts
 
 
+def dropped_tool_types(resp_payload: dict) -> list[dict]:
+    """List the tools that will be dropped because Chat Completions cannot carry them.
+
+    BUD-011: the gateway silently skipped non-function tools (web_search,
+    file_search, code_interpreter, ...), so a capability regression looked like
+    the model "choosing" to answer in prose. Reporting the drop makes the
+    degradation visible without changing behaviour (they are still skipped).
+    """
+    dropped: list[dict] = []
+    for tool in resp_payload.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "function":
+            continue
+        dropped.append({"type": tool.get("type"), "name": tool.get("name")})
+    return dropped
+
+
 def responses_to_chat(resp_payload: dict) -> dict:
     """
     将 Responses API 请求转换为 Chat Completions 请求。
@@ -342,6 +360,11 @@ def responses_to_chat(resp_payload: dict) -> dict:
         "messages": messages,
         "stream": resp_payload.get("stream", False),
     }
+    dropped = dropped_tool_types(resp_payload)
+    if dropped:
+        # Internal metadata: read by proxy_responses / the HTTP layer, never sent
+        # upstream (build_backend_body drops keys starting with "_").
+        chat_payload["_dropped_tools"] = dropped
     if tools:
         chat_payload["tools"] = tools
     if tool_choice is not None:
@@ -462,16 +485,39 @@ def _flatten_content(content) -> str:
 # Chat → Responses 响应映射（非流式）
 # ============================================================
 
+def _optional_int(container, key: str) -> Optional[int]:
+    """Return the value only when the upstream actually reported it, else None.
+
+    Distinguishing "upstream said 0" from "upstream said nothing" matters for
+    cache analysis (BUD-010): filling a missing ``cached_tokens`` with 0 makes a
+    real cache miss indistinguishable from a field the upstream simply omitted,
+    so the cache-hit rate can never be measured honestly.
+    """
+    if not isinstance(container, dict):
+        return None
+    value = container.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _responses_usage(usage: dict) -> dict:
     input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
     output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
     input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     output_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    input_details_out = {"cached_tokens": _optional_int(input_details, "cached_tokens")}
+    # ``cache_write_tokens`` only appears on some providers; keep it absent (not
+    # 0) when unreported so the two cases stay distinguishable.
+    cache_write = _optional_int(input_details, "cache_write_tokens")
+    if cache_write is not None:
+        input_details_out["cache_write_tokens"] = cache_write
     return {
         "input_tokens": input_tokens,
-        "input_tokens_details": {
-            "cached_tokens": input_details.get("cached_tokens", 0),
-        },
+        "input_tokens_details": input_details_out,
         "output_tokens": output_tokens,
         "output_tokens_details": {
             "reasoning_tokens": output_details.get("reasoning_tokens", 0),

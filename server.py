@@ -455,6 +455,23 @@ async def list_models(
     return {"object": "list", "data": public_v1_models()}
 
 
+def _retry_after_headers(detail) -> dict:
+    """Surface the earliest cooldown as a Retry-After header when the pool is cooling.
+
+    Only set when a body already carries ``retry_after`` (the all-accounts-cooling
+    shape). Normal errors pass through with no extra headers.
+    """
+    try:
+        error = detail.get("error") if isinstance(detail, dict) else None
+        if isinstance(error, dict) and error.get("code") == "all_accounts_cooling":
+            seconds = int(error.get("retry_after") or 0)
+            if seconds > 0:
+                return {"Retry-After": str(seconds)}
+    except (TypeError, ValueError):
+        pass
+    return {}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -492,7 +509,7 @@ async def chat_completions(
 
     if result[0] == "error":
         status, detail = result[1]
-        return JSONResponse(status_code=status, content=detail)
+        return JSONResponse(status_code=status, content=detail, headers=_retry_after_headers(detail))
     elif result[0] == "json":
         return JSONResponse(content=result[1])
     elif result[0] == "stream":
@@ -552,16 +569,25 @@ async def resp_responses(
         sys.stderr.flush()
         return JSONResponse(status_code=502, content={"error": {"message": f"internal bridge error: {e}", "type": "server_error"}})
 
+    # BUD-011: surface tools dropped because Chat Completions cannot carry them,
+    # so a capability downgrade is visible instead of looking like model behaviour.
+    dropped = responses.dropped_tool_types(payload)
+    extra_headers = {}
+    if dropped:
+        extra_headers["X-Buddy-Dropped-Tools"] = ",".join(
+            str(item.get("type") or "unknown") for item in dropped
+        )
     if result[0] == "error":
         status, detail = result[1]
-        return JSONResponse(status_code=status, content=detail)
+        return JSONResponse(status_code=status, content=detail,
+                            headers={**_retry_after_headers(detail), **extra_headers})
     elif result[0] == "json":
-        return JSONResponse(content=result[1])
+        return JSONResponse(content=result[1], headers=extra_headers)
     elif result[0] == "stream":
         return StreamingResponse(
             result[1],
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **extra_headers},
         )
 
 

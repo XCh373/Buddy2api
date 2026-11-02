@@ -91,8 +91,9 @@ def test_tally_survives_cooldown(isolated_db, monkeypatch):
 
     auth_manager.mark_account_failure(aid, 401, structural_auth=True)
     clock[0] += 400
-    auth_manager.account_is_cooling_down(aid)          # purges the cooldown record
-    assert aid not in auth_manager._account_failures
+    # 冷却已过期：不再处于冷却中，但失败计数必须保留（BUD-005 的核心修复）。
+    assert auth_manager.account_is_cooling_down(aid) is False
+    assert aid in auth_manager._failure_counts
     assert auth_manager.auth_confirmation_count(aid) == 1
 
     auth_manager.mark_account_failure(aid, 401, structural_auth=True)
