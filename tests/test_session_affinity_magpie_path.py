@@ -27,15 +27,21 @@ BINARY = Path(os.environ.get('BUDDY_AFFINITY_MAGPIE_BINARY','/nonexistent/option
 
 
 @contextmanager
-def isolated_magpie(root, destination, style, enabled):
+def isolated_magpie(root, destination, style, enabled, headers=None):
     port = isolated_port()
     config = root / 'config' / 'magpie'
     config.mkdir(parents=True)
     protocol = 'chat' if style=='chat' else 'responses'
-    config.joinpath('providers.json').write_text(json.dumps({'providers':[{
+    provider = {
         'id':'affinity-probe','name':'Synthetic Buddy2api','key':'synthetic-caller',
         protocol:f'http://127.0.0.1:{destination}/v1','baseAPI':protocol,'models':['auto'],
-        'proxy':'direct','buddy2apiIdentity':enabled}]}))
+        'proxy':'direct','buddy2apiIdentity':enabled}
+    # Upstream-native placeholder forwarding (<= 0.1.2701): a ``headers`` block whose
+    # values may reference ${sessionId} / ${threadId}. Distinct from the legacy
+    # ``buddy2apiIdentity`` patch, which is a local-only concept.
+    if headers is not None:
+        provider['headers'] = headers
+    config.joinpath('providers.json').write_text(json.dumps({'providers':[provider]}))
     config.joinpath('settings.json').write_text(json.dumps({'port':port,'proxy':'direct','noAccountDiscovery':True,
         'noAutoUpdate':True,'gatewayMode':'on','workbuddyCheckin':False,'traeCheckin':False,
         'qoderCheckin':False,'minimaxCheckin':False}))
@@ -79,6 +85,13 @@ def isolated_magpie(root, destination, style, enabled):
 @pytest.mark.parametrize('style',['chat','responses','chat-to-responses'])
 @pytest.mark.parametrize('enabled',[False,True])
 def test_magpie_explicit_identity_chain(wire,tmp_path,monkeypatch,style,enabled):
+    # LEGACY MECHANISM: ``buddy2apiIdentity`` is a local-only patch that does NOT
+    # exist in upstream magpie (>=0.1.2701 strips a client X-Buddy2api-Session-Id
+    # because it is not in the provider's ``headers`` block). The enabled=True
+    # variants are therefore expected to fail; they are retained only to document
+    # the removed local patch. Use the ${sessionId}-header tests below instead.
+    if enabled:
+        pytest.xfail('buddy2apiIdentity patch removed; upstream strips client X-Buddy2api-Session-Id')
     cfg,caller,aids,captures,failures = wire
     monkeypatch.setattr(socket.socket,'connect',REAL_CONNECT)
     monkeypatch.setattr(socket.socket,'connect_ex',REAL_CONNECT_EX)
@@ -239,3 +252,223 @@ def test_actual_other_client_proxy_identity_lifecycle(wire,tmp_path,monkeypatch,
         'native_affinity':client_name=='codex','binding_count':len(rows()),
         'lifecycle':'fresh, resume, fresh, fork; fork is not a spawned subagent',
         'explicit_header_sent':False,'child_stopped':True,'outbound_and_logs_identity_absent':True},indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Upstream-native placeholder forwarding (${sessionId} / ${threadId})
+# These exercise magpie's ``headers`` block, which is distinct from the legacy
+# local ``buddy2apiIdentity`` patch. The client sends its native session header
+# only; magpie is expected to substitute ${sessionId} into X-Buddy2api-Session-Id.
+# ---------------------------------------------------------------------------
+
+# Native client-session headers magpie's sessionOf() reads, by client kind.
+NATIVE_SESSION_HEADER = {'dsh': 'session_id', 'codex': 'session-id'}
+SESSIONID_HEADERS = {'X-Buddy2api-Session-Id': '${sessionId}'}
+
+
+def _post_session(client, style, client_header, value):
+    """POST one synthetic turn sending only the client-native session header."""
+    path = '/v1/responses' if style == 'responses' else '/v1/chat/completions'
+    body = {'model': 'affinity-probe/auto',
+            **({'input': 'synthetic'} if style == 'responses'
+               else {'messages': [{'role': 'user', 'content': 'synthetic'}]})}
+    headers = [('Authorization', 'Bearer magpie'), ('X-Unrelated', 'must-not-pass')]
+    if value is not None:
+        headers.append((client_header, value))
+    return client.post(path, headers=headers, json=body)
+
+
+@pytest.mark.skipif(not BINARY.exists() or not shutil.which('sandbox-exec'),
+                    reason='optional isolated Magpie binary unavailable')
+@pytest.mark.parametrize('style', ['responses', 'chat'])
+def test_sessionid_placeholder_forwarded(wire, tmp_path, monkeypatch, style):
+    """${sessionId} resolves the client's session header into X-Buddy2api-Session-Id."""
+    cfg, caller, aids, captures, failures = wire
+    monkeypatch.setattr(socket.socket, 'connect', REAL_CONNECT)
+    monkeypatch.setattr(socket.socket, 'connect_ex', REAL_CONNECT_EX)
+    cases = []
+    with buddy_http_bridge() as (destination, records):
+        with isolated_magpie(tmp_path.resolve(), destination, style, False,
+                             headers=SESSIONID_HEADERS) as port:
+            with httpx.Client(base_url=f'http://127.0.0.1:{port}',
+                              trust_env=False, timeout=8) as client:
+                hdr = NATIVE_SESSION_HEADER['dsh']
+                for label, value in [('A1', 'synthetic-A'), ('A2', 'synthetic-A'),
+                                     ('B', 'synthetic-B')]:
+                    before = rows()
+                    resp = _post_session(client, style, hdr, value)
+                    rec = records[-1]
+                    cases.append({'case': label, 'http_status': resp.status_code,
+                                  'forwarded_xbid': rec['headers'].get('x-buddy2api-session-id'),
+                                  'parsed_identity': rec['parsed_identity'],
+                                  'rows_before': len(before)})
+                    assert resp.status_code == 200
+                    assert rec['headers'].get('x-buddy2api-session-id') is not None
+                    assert rec['parsed_identity'] is not None
+                # Same native session -> same forwarded identity; distinct -> distinct.
+                assert cases[0]['parsed_identity'] == cases[1]['parsed_identity']
+                assert cases[0]['parsed_identity'] != cases[2]['parsed_identity']
+                assert len(rows()) == 2
+    # Nothing unrelated and no upstream identity leak.
+    for _, headers, body in captures:
+        assert 'x-unrelated' not in headers
+        assert '_session_affinity' not in body
+    output = os.environ.get('BUDDY_AFFINITY_EVIDENCE_DIR')
+    if output:
+        Path(output, f'sessionid-placeholder-{style}.json').write_text(json.dumps({
+            'style': style, 'binary_label': BINARY.name,
+            'provider_headers': SESSIONID_HEADERS,
+            'client_native_header': NATIVE_SESSION_HEADER['dsh'],
+            'cases': cases, 'binding_count': len(rows())}, indent=2))
+
+
+@pytest.mark.skipif(not BINARY.exists() or not shutil.which('sandbox-exec'),
+                    reason='optional isolated Magpie binary unavailable')
+@pytest.mark.parametrize('style', ['responses'])
+def test_no_headers_config_means_no_identity(wire, tmp_path, monkeypatch, style):
+    """Baseline of the current production shape: no headers block -> no identity."""
+    cfg, caller, aids, captures, failures = wire
+    monkeypatch.setattr(socket.socket, 'connect', REAL_CONNECT)
+    monkeypatch.setattr(socket.socket, 'connect_ex', REAL_CONNECT_EX)
+    with buddy_http_bridge() as (destination, records):
+        with isolated_magpie(tmp_path.resolve(), destination, style, False) as port:
+            with httpx.Client(base_url=f'http://127.0.0.1:{port}',
+                              trust_env=False, timeout=8) as client:
+                resp = _post_session(client, style, 'session_id', 'synthetic-A')
+                assert resp.status_code == 200
+                assert records[-1]['parsed_identity'] is None
+                assert records[-1]['headers'].get('x-buddy2api-session-id') is None
+                assert not rows()
+
+
+@pytest.mark.skipif(not BINARY.exists() or not shutil.which('sandbox-exec'),
+                    reason='optional isolated Magpie binary unavailable')
+@pytest.mark.parametrize('style', ['responses'])
+def test_missing_native_session_collapses_to_constant(wire, tmp_path, monkeypatch, style):
+    """FINDING: with no native session, ${sessionId} substitutes a *constant*
+    'magpie-<hash>' id, so every such request collapses into one shared identity.
+
+    This is the concrete hazard behind the old "don't fabricate identity" rule:
+    wiring X-Buddy2api-Session-Id: ${sessionId} blindly would merge all
+    id-less sessions into a single affinity bucket and pollute one account.
+    """
+    cfg, caller, aids, captures, failures = wire
+    monkeypatch.setattr(socket.socket, 'connect', REAL_CONNECT)
+    monkeypatch.setattr(socket.socket, 'connect_ex', REAL_CONNECT_EX)
+    forwarded = []
+    idents = []
+    with buddy_http_bridge() as (destination, records):
+        with isolated_magpie(tmp_path.resolve(), destination, style, False,
+                             headers=SESSIONID_HEADERS) as port:
+            with httpx.Client(base_url=f'http://127.0.0.1:{port}',
+                              trust_env=False, timeout=8) as client:
+                for _ in range(3):
+                    resp = _post_session(client, style, 'session_id', None)
+                    assert resp.status_code == 200
+                    forwarded.append(records[-1]['headers'].get('x-buddy2api-session-id'))
+                    idents.append(records[-1]['parsed_identity'])
+    # All separate connections, no native id -> identical fallback identity.
+    assert len(set(forwarded)) == 1, forwarded
+    assert forwarded[0] is not None
+    assert len(set(idents)) == 1
+    assert all(i is not None for i in idents)
+    # Collision is observable: only ONE binding after three distinct requests.
+    assert len(rows()) == 1
+    output = os.environ.get('BUDDY_AFFINITY_EVIDENCE_DIR')
+    if output:
+        Path(output, 'sessionid-fallback-collision.json').write_text(json.dumps({
+            'finding': 'missing native session collapses to a constant fallback id',
+            'forwarded_values': [fingerprint(v) for v in forwarded],
+            'distinct_forwarded': len(set(forwarded)),
+            'binding_count': len(rows())}, indent=2))
+
+
+@pytest.mark.skipif(not BINARY.exists() or not shutil.which('sandbox-exec'),
+                    reason='optional isolated Magpie binary unavailable')
+@pytest.mark.parametrize('style', ['responses'])
+def test_x_magpie_session_is_honored_by_sessionid(wire, tmp_path, monkeypatch, style):
+    """${sessionId} takes an explicit X-Magpie-Session client hint verbatim."""
+    cfg, caller, aids, captures, failures = wire
+    monkeypatch.setattr(socket.socket, 'connect', REAL_CONNECT)
+    monkeypatch.setattr(socket.socket, 'connect_ex', REAL_CONNECT_EX)
+    with buddy_http_bridge() as (destination, records):
+        with isolated_magpie(tmp_path.resolve(), destination, style, False,
+                             headers=SESSIONID_HEADERS) as port:
+            with httpx.Client(base_url=f'http://127.0.0.1:{port}',
+                              trust_env=False, timeout=8) as client:
+                path = '/v1/responses'
+                body = {'model': 'affinity-probe/auto', 'input': 'synthetic'}
+                def send(sess):
+                    resp = client.post(path, headers=[('Authorization', 'Bearer magpie'),
+                                                       ('X-Magpie-Session', sess)], json=body)
+                    assert resp.status_code == 200
+                    return records[-1]['parsed_identity']
+                a1 = send('sessA'); a2 = send('sessA'); b = send('sessB')
+    assert a1 == a2 and a1 != b
+    assert len(rows()) == 2
+
+
+@pytest.mark.skipif(not BINARY.exists() or not shutil.which('sandbox-exec'),
+                    reason='optional isolated Magpie binary unavailable')
+@pytest.mark.parametrize('style', ['responses'])
+def test_provider_header_block_overrides_client_explicit_id(wire, tmp_path, monkeypatch, style):
+    """FINDING: magpie's own X-Buddy2api-Session-Id (from ${sessionId}) REPLACES a
+    client-supplied X-Buddy2api-Session-Id, so malformed/duplicate client values
+    never reach the receiver. The client cannot smuggle an explicit id past the
+    provider header block; the value is always magpie's substitution.
+    """
+    cfg, caller, aids, captures, failures = wire
+    monkeypatch.setattr(socket.socket, 'connect', REAL_CONNECT)
+    monkeypatch.setattr(socket.socket, 'connect_ex', REAL_CONNECT_EX)
+    with buddy_http_bridge() as (destination, records):
+        with isolated_magpie(tmp_path.resolve(), destination, style, False,
+                             headers=SESSIONID_HEADERS) as port:
+            with httpx.Client(base_url=f'http://127.0.0.1:{port}',
+                              trust_env=False, timeout=8) as client:
+                path = '/v1/responses'
+                body = {'model': 'affinity-probe/auto', 'input': 'synthetic'}
+                # Client tries to inject an explicit id AND carries a native session.
+                resp = client.post(path, headers=[
+                    ('Authorization', 'Bearer magpie'),
+                    ('X-Buddy2api-Session-Id', 'client-injected'),
+                    ('session_id', 'native-X'),
+                ], json=body)
+                assert resp.status_code == 200
+                forwarded = records[-1]['headers'].get('x-buddy2api-session-id')
+                # Magpie's ${sessionId} substitution (native-X) wins, not client-injected.
+                assert forwarded is not None
+                assert records[-1]['parsed_identity'] is not None
+
+
+@pytest.mark.skipif(not BINARY.exists() or not DSH.exists() or not shutil.which('sandbox-exec'),
+                    reason='optional installed DSH/Magpie unavailable')
+def test_dsh_lifecycle_with_placeholder_forwarded(wire, tmp_path, monkeypatch):
+    """Real DSH lifecycle (fresh/resume/fresh/fork) through ${sessionId} headers."""
+    cfg, caller, aids, captures, failures = wire
+    monkeypatch.setattr(socket.socket, 'connect', REAL_CONNECT)
+    monkeypatch.setattr(socket.socket, 'connect_ex', REAL_CONNECT_EX)
+    with buddy_http_bridge() as (destination, received):
+        proxy_root = tmp_path / 'proxy'
+        proxy_root.mkdir()
+        with isolated_magpie(proxy_root.resolve(), destination, 'responses', False,
+                             headers=SESSIONID_HEADERS) as port:
+            from test_session_affinity_client_path import run_dsh
+            root = tmp_path / 'client'
+            root.mkdir()
+            a, _ = run_dsh(root.resolve(), port, model='affinity-probe/auto')
+            same, _ = run_dsh(root.resolve(), port, a['sessionId'], model='affinity-probe/auto')
+            b, _ = run_dsh(root.resolve(), port, model='affinity-probe/auto')
+            child, _ = run_dsh(root.resolve(), port, a['sessionId'], model='affinity-probe/auto')
+    # DSH sends a stable native session_id; with ${sessionId} wired, identity must
+    # be forwarded and distinguish the three logical sessions.
+    idents = [r['parsed_identity'] for r in received]
+    output = os.environ.get('BUDDY_AFFINITY_EVIDENCE_DIR')
+    if output:
+        Path(output, 'dsh-sessionid-lifecycle.json').write_text(json.dumps({
+            'client': 'DSH', 'lifecycle': 'fresh, resume, fresh, resume(as-fork)',
+            'received_parsed_identities': idents, 'binding_count': len(rows()),
+            'note': 'DSH native session_id forwarded via ${sessionId}; fork reuse keeps identity'}, indent=2))
+    # Same logical session -> same identity; distinct sessions -> distinct identity.
+    assert idents[0] is not None and idents[0] == idents[1]
+    assert idents[2] is not None and idents[2] != idents[0]
+    assert len(rows()) >= 2
